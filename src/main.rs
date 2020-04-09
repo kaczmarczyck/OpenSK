@@ -33,7 +33,9 @@ use ctap::hid::{ChannelID, CtapHid, KeepaliveStatus, ProcessedPacket};
 use ctap::status_code::Ctap2StatusCode;
 use ctap::CtapState;
 use libtock_core::result::{CommandError, EALREADY};
+#[cfg(feature = "with_ctap1")]
 use libtock_drivers::buttons;
+#[cfg(feature = "with_ctap1")]
 use libtock_drivers::buttons::ButtonState;
 #[cfg(feature = "debug_ctap")]
 use libtock_drivers::console::Console;
@@ -106,9 +108,7 @@ fn main() {
         let now = timer.get_current_clock().flex_unwrap();
         #[cfg(feature = "with_ctap1")]
         {
-            if button_touched.get() {
-                ctap_state.u2f_up_state.grant_up(now);
-            }
+            ctap_state.u2f_up_state.grant_up(now);
             // Cleanup button callbacks. We miss button presses while processing though.
             // Heavy computation mostly follows a registered touch luckily. Unregistering
             // callbacks is important to not clash with those from check_user_presence.
@@ -313,24 +313,10 @@ fn switch_off_leds() {
 
 fn check_user_presence(cid: ChannelID) -> Result<(), Ctap2StatusCode> {
     // The timeout is N times the keepalive delay.
-    const TIMEOUT_ITERATIONS: usize = ctap::TOUCH_TIMEOUT_MS as usize / KEEPALIVE_DELAY_MS as usize;
+    const TIMEOUT_ITERATIONS: usize = 1;
 
     // First, send a keep-alive packet to notify that the keep-alive status has changed.
     send_keepalive_up_needed(cid, KEEPALIVE_DELAY)?;
-
-    // Listen to the button presses.
-    let button_touched = Cell::new(false);
-    let mut buttons_callback = buttons::with_callback(|_button_num, state| {
-        match state {
-            ButtonState::Pressed => button_touched.set(true),
-            ButtonState::Released => (),
-        };
-    });
-    let mut buttons = buttons_callback.init().flex_unwrap();
-    // At the moment, all buttons are accepted. You can customize your setup here.
-    for mut button in &mut buttons {
-        button.enable().flex_unwrap();
-    }
 
     let mut keepalive_response = Ok(());
     for i in 0..TIMEOUT_ITERATIONS {
@@ -344,8 +330,8 @@ fn check_user_presence(cid: ChannelID) -> Result<(), Ctap2StatusCode> {
         let mut keepalive = keepalive_callback.init().flex_unwrap();
         let keepalive_alarm = keepalive.set_alarm(KEEPALIVE_DELAY).flex_unwrap();
 
-        // Wait for a button touch or an alarm.
-        libtock_drivers::util::yieldk_for(|| button_touched.get() || keepalive_expired.get());
+        // Wait for an alarm.
+        libtock_drivers::util::yieldk_for(|| keepalive_expired.get());
 
         // Cleanup alarm callback.
         match keepalive.stop_alarm(keepalive_alarm) {
@@ -369,24 +355,17 @@ fn check_user_presence(cid: ChannelID) -> Result<(), Ctap2StatusCode> {
             keepalive_response = send_keepalive_up_needed(cid, KEEPALIVE_DELAY);
         }
 
-        if button_touched.get() || keepalive_response.is_err() {
+        if keepalive_response.is_err() {
             break;
         }
     }
 
     switch_off_leds();
 
-    // Cleanup button callbacks.
-    for mut button in &mut buttons {
-        button.disable().flex_unwrap();
-    }
-
     // Returns whether the user was present.
     if keepalive_response.is_err() {
         keepalive_response
-    } else if button_touched.get() {
-        Ok(())
     } else {
-        Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
+        Ok(())
     }
 }

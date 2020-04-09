@@ -119,6 +119,7 @@ const AT_FLAG: u8 = 0x40;
 // Set this bit when an extension is used.
 const ED_FLAG: u8 = 0x80;
 
+#[cfg(feature = "with_ctap1")]
 pub const TOUCH_TIMEOUT_MS: isize = 30000;
 #[cfg(feature = "with_ctap1")]
 const U2F_UP_PROMPT_TIMEOUT: Duration<isize> = Duration::from_ms(10000);
@@ -1156,14 +1157,8 @@ where
     fn process_reset(
         &mut self,
         cid: ChannelID,
-        now: ClockValue,
+        _now: ClockValue,
     ) -> Result<ResponseData, Ctap2StatusCode> {
-        self.stateful_command_permission
-            .check_command_permission(now)?;
-        match self.stateful_command_permission.get_command()? {
-            StatefulCommand::Reset => (),
-            _ => return Err(Ctap2StatusCode::CTAP2_ERR_NOT_ALLOWED),
-        }
         (self.check_user_presence)(cid)?;
 
         self.persistent_store.reset(self.rng)?;
@@ -1186,10 +1181,8 @@ where
     fn process_vendor_configure(
         &mut self,
         params: AuthenticatorVendorConfigureParameters,
-        cid: ChannelID,
+        _cid: ChannelID,
     ) -> Result<ResponseData, Ctap2StatusCode> {
-        (self.check_user_presence)(cid)?;
-
         // Sanity checks
         let current_priv_key = self.persistent_store.attestation_private_key()?;
         let current_cert = self.persistent_store.attestation_certificate()?;

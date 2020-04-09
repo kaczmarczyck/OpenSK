@@ -199,9 +199,6 @@ impl PinProtocolV1 {
     ) -> Result<(), Ctap2StatusCode> {
         match persistent_store.pin_hash()? {
             Some(pin_hash) => {
-                if self.consecutive_pin_mismatches >= 3 {
-                    return Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_BLOCKED);
-                }
                 persistent_store.decr_pin_retries()?;
                 if pin_hash_enc.len() != PIN_AUTH_LENGTH {
                     return Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID);
@@ -218,9 +215,6 @@ impl PinProtocolV1 {
                         return Err(Ctap2StatusCode::CTAP2_ERR_PIN_BLOCKED);
                     }
                     self.consecutive_pin_mismatches += 1;
-                    if self.consecutive_pin_mismatches >= 3 {
-                        return Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_BLOCKED);
-                    }
                     return Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID);
                 }
             }
