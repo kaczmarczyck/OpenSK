@@ -455,8 +455,6 @@ mod test {
             4 => vec! [0xBB],
             5 => vec! [0xCC],
             6 => vec! [0xDD],
-            #[cfg(feature = "with_ctap2_1")]
-            7 => 4,
         };
         let returned_pin_protocol_parameters =
             AuthenticatorClientPinParameters::try_from(cbor_value).unwrap();
