@@ -336,7 +336,7 @@ impl PinProtocolV1 {
         cbc_encrypt(&token_encryption_key, iv, &mut blocks);
         let pin_token: Vec<u8> = blocks.iter().flatten().cloned().collect();
 
-        self.permissions = 0x03;
+        self.permissions = 0x03 | PinPermission::CredentialManagement as u8;
         self.permissions_rp_id = None;
 
         Ok(AuthenticatorClientPinResponse {
