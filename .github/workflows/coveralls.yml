@@ -27,21 +27,23 @@ jobs:
       - name: Set up OpenSK
         run: ./setup.sh
 
-      - name: Install grcov
-        run: if [[ ! -e ~/.cargo/bin/grcov ]]; then cargo +stable install grcov; fi
+      - name: Install cargo kcov
+        run: cargo +stable install cargo-kcov
+      - name: Install packages
+        run: sudo apt-get install cmake g++ pkg-config jq libcurl4-openssl-dev libelf-dev libdw-dev binutils-dev libiberty-dev
+      - name: Install kcov
+        run: cargo kcov --print-install-kcov-sh | sh
+
+      - name: Run kcov
+        run: sed -i 's/nightly-2021-03-25/nightly-2021-09-25/' rust-toolchain
       - uses: actions-rs/cargo@v1
         with:
-          command: test
-          args: --features "with_ctap1,with_nfc,std" --no-fail-fast
-        env:
-          CARGO_INCREMENTAL: '0'
-          RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-      - uses: actions-rs/grcov@v0.1.5
-        id: coverage
-      - uses: coverallsapp/github-action@1.1.3
-        name: upload report to coveralls
+          command: build
+          args: --features with_ctap1,with_nfc,std
+      - uses: actions-rs/cargo@v1
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path-to-lcov: ${{ steps.coverage.outputs.report }}
+          command: kcov
+          args: --features with_ctap1,with_nfc,std --no-fail-fast --coveralls -- --exclude-pattern=third_party,/usr/lib/gcc,/home/kaczmarczyck/.cargo --coveralls-id=${{ secrets.GITHUB_TOKEN }}
+        env:
+          TRAVIS_JOB_ID: ${{ secrets.GITHUB_TOKEN }}
 
