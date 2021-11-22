@@ -34,16 +34,18 @@ jobs:
       - name: Install kcov
         run: cargo kcov --print-install-kcov-sh | sh
 
-      - name: Run kcov
-        run: sed -i 's/nightly-2021-03-25/nightly-2021-09-25/' rust-toolchain
-      - uses: actions-rs/cargo@v1
+      - name: Build
+        uses: actions-rs/cargo@v1
         with:
           command: build
           args: --features with_ctap1,with_nfc,std
-      - uses: actions-rs/cargo@v1
+      - name: Install nightly to workaround ICE
+        uses: actions-rs/toolchain@v1
         with:
-          command: kcov
-          args: --features with_ctap1,with_nfc,std --no-fail-fast --coveralls -- --exclude-pattern=third_party,/usr/lib/gcc,/home/kaczmarczyck/.cargo --coveralls-id=${{ secrets.GITHUB_TOKEN }}
+            toolchain: nightly-2021-09-25
+            override: true
+      - name: Run kcov
+        run: cargo +nightly-2021-09-25 kcov --features with_ctap1,with_nfc,std --no-fail-fast --coveralls -- --exclude-pattern=third_party,/usr/lib/gcc,/home/kaczmarczyck/.cargo --coveralls-id=${{ secrets.GITHUB_TOKEN }}
         env:
           TRAVIS_JOB_ID: ${{ secrets.GITHUB_TOKEN }}
 
