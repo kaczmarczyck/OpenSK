@@ -105,7 +105,7 @@ impl<E: Env> PinUvAuthTokenState<E> {
     ///
     /// Allows MakeCredential and GetAssertion, without specifying a RP ID.
     pub fn set_default_permissions(&mut self) {
-        self.set_permissions(0x03);
+        self.set_permissions(0x03 | PinPermission::CredentialManagement as u8);
         self.set_permissions_rp_id(None);
     }
 

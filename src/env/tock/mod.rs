@@ -14,20 +14,17 @@
 
 use alloc::vec::Vec;
 use clock::TockClock;
-use core::cell::Cell;
 use core::convert::TryFrom;
 use core::marker::PhantomData;
 #[cfg(all(target_has_atomic = "8", not(feature = "std")))]
 use core::sync::atomic::{AtomicBool, Ordering};
-use libtock_buttons::{ButtonListener, ButtonState, Buttons};
 use libtock_console::{Console, ConsoleWriter};
-use libtock_drivers::result::{FlexUnwrap, TockError};
 use libtock_drivers::timer::Duration;
 use libtock_drivers::usb_ctap_hid::UsbCtapHid;
-use libtock_drivers::{rng, timer, usb_ctap_hid};
+use libtock_drivers::{rng, usb_ctap_hid};
 use libtock_leds::Leds;
 use libtock_platform as platform;
-use libtock_platform::{ErrorCode, Syscalls};
+use libtock_platform::Syscalls;
 use opensk::api::attestation_store::AttestationStore;
 use opensk::api::connection::{
     HidConnection, SendOrRecvError, SendOrRecvResult, SendOrRecvStatus, UsbEndpoint,
@@ -35,14 +32,14 @@ use opensk::api::connection::{
 use opensk::api::crypto::software_crypto::SoftwareCrypto;
 use opensk::api::customization::{CustomizationImpl, AAGUID_LENGTH, DEFAULT_CUSTOMIZATION};
 use opensk::api::rng::Rng;
-use opensk::api::user_presence::{UserPresence, UserPresenceError, UserPresenceResult};
+use opensk::api::user_presence::{UserPresence, UserPresenceResult};
 use opensk::api::{attestation_store, key_store};
 use opensk::ctap::Channel;
 use opensk::env::Env;
 #[cfg(feature = "std")]
 use persistent_store::BufferOptions;
 use persistent_store::{StorageResult, Store};
-use platform::{share, DefaultConfig, Subscribe};
+use platform::DefaultConfig;
 use rand_core::{impls, CryptoRng, Error, RngCore};
 
 #[cfg(feature = "std")]
@@ -269,89 +266,8 @@ where
         self.blink_pattern = 0;
     }
 
-    fn wait_with_timeout(&mut self, timeout_ms: usize) -> UserPresenceResult {
-        if timeout_ms == 0 {
-            return Err(UserPresenceError::Timeout);
-        }
-        blink_leds::<S>(self.blink_pattern);
-        self.blink_pattern += 1;
-
-        // enable interrupts for all buttons
-        let num_buttons = Buttons::<S>::count().map_err(|_| UserPresenceError::Fail)?;
-        (0..num_buttons)
-            .try_for_each(|n| Buttons::<S>::enable_interrupts(n))
-            .map_err(|_| UserPresenceError::Fail)?;
-
-        let button_touched = Cell::new(false);
-        let button_listener = ButtonListener(|_button_num, state| {
-            match state {
-                ButtonState::Pressed => button_touched.set(true),
-                ButtonState::Released => (),
-            };
-        });
-
-        // Setup a keep-alive callback but don't enable it yet
-        let keepalive_expired = Cell::new(false);
-        let mut keepalive_callback =
-            timer::with_callback::<S, C, _>(|_| keepalive_expired.set(true));
-        share::scope::<
-            (
-                Subscribe<_, { libtock_buttons::DRIVER_NUM }, 0>,
-                Subscribe<
-                    S,
-                    { libtock_drivers::timer::DRIVER_NUM },
-                    { libtock_drivers::timer::subscribe::CALLBACK },
-                >,
-            ),
-            _,
-            _,
-        >(|handle| {
-            let (sub_button, sub_timer) = handle.split();
-            Buttons::<S>::register_listener(&button_listener, sub_button)
-                .map_err(|_| UserPresenceError::Fail)?;
-
-            let mut keepalive = keepalive_callback.init().flex_unwrap();
-            keepalive_callback
-                .enable(sub_timer)
-                .map_err(|_| UserPresenceError::Fail)?;
-            keepalive
-                .set_alarm(timer::Duration::from_ms(timeout_ms as isize))
-                .flex_unwrap();
-
-            // Wait for a button touch or an alarm.
-            libtock_drivers::util::Util::<S>::yieldk_for(|| {
-                button_touched.get() || keepalive_expired.get()
-            });
-
-            Buttons::<S>::unregister_listener();
-
-            // disable event interrupts for all buttons
-            (0..num_buttons)
-                .try_for_each(|n| Buttons::<S>::disable_interrupts(n))
-                .map_err(|_| UserPresenceError::Fail)?;
-
-            // Cleanup alarm callback.
-            match keepalive.stop_alarm() {
-                Ok(()) => (),
-                Err(TockError::Command(ErrorCode::Already)) => assert!(keepalive_expired.get()),
-                Err(_e) => {
-                    #[cfg(feature = "debug_ctap")]
-                    panic!("Unexpected error when stopping alarm: {:?}", _e);
-                    #[cfg(not(feature = "debug_ctap"))]
-                    panic!("Unexpected error when stopping alarm: <error is only visible with the debug_ctap feature>");
-                }
-            }
-
-            Ok::<(), UserPresenceError>(())
-        })?;
-
-        if button_touched.get() {
-            Ok(())
-        } else if keepalive_expired.get() {
-            Err(UserPresenceError::Timeout)
-        } else {
-            panic!("Unexpected exit condition");
-        }
+    fn wait_with_timeout(&mut self, _timeout_ms: usize) -> UserPresenceResult {
+        Ok(())
     }
 
     fn check_complete(&mut self) {

@@ -329,8 +329,6 @@ impl<E: Env> ClientPin<E> {
             return Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID);
         }
 
-        self.pin_protocol_v1.reset_pin_uv_auth_token(env);
-        self.pin_protocol_v2.reset_pin_uv_auth_token(env);
         self.pin_uv_auth_token_state
             .begin_using_pin_uv_auth_token(env);
         self.pin_uv_auth_token_state.set_default_permissions();

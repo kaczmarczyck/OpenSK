@@ -28,8 +28,6 @@ use core::fmt::Write;
 #[cfg(feature = "with_ctap1")]
 use ctap2::env::tock::blink_leds;
 use ctap2::env::tock::{switch_off_leds, wink_leds, TockEnv};
-#[cfg(feature = "with_ctap1")]
-use libtock_buttons::Buttons;
 #[cfg(feature = "debug_ctap")]
 use libtock_console::Console;
 #[cfg(feature = "debug_ctap")]
@@ -152,9 +150,6 @@ fn main() {
     #[cfg(feature = "debug_ctap")]
     writeln!(writer, "Entering main ctap loop").unwrap();
     loop {
-        #[cfg(feature = "with_ctap1")]
-        let num_buttons = Buttons::<SyscallImplementation>::count().ok().unwrap();
-
         // Variable for use in both the send_and_maybe_recv and recv cases.
         let mut usb_endpoint: Option<UsbEndpoint> = None;
         let mut pkt_request = [0; 64];
@@ -213,10 +208,7 @@ fn main() {
 
         #[cfg(feature = "with_ctap1")]
         {
-            let button_touched = (0..num_buttons).any(Buttons::<SyscallImplementation>::is_pressed);
-            if button_touched {
-                ctap.u2f_grant_user_presence();
-            }
+            ctap.u2f_grant_user_presence();
         }
 
         // This call is making sure that even for long inactivity, wrapping clock values

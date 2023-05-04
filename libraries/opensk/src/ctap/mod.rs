@@ -1343,16 +1343,8 @@ impl<E: Env> CtapState<E> {
     fn process_reset(
         &mut self,
         env: &mut E,
-        channel: Channel,
+        _channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
-        if !matches!(
-            self.stateful_command_permission.get_command(env)?,
-            StatefulCommand::Reset
-        ) {
-            return Err(Ctap2StatusCode::CTAP2_ERR_NOT_ALLOWED);
-        }
-        check_user_presence(env, channel)?;
-
         storage::reset(env)?;
         self.client_pin.reset(env);
         #[cfg(feature = "with_ctap1")]
