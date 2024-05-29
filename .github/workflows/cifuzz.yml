@@ -3,15 +3,10 @@ on:
   push:
     branches:
       - develop
-  pull_request:
-    branches:
-      - develop
-
 jobs:
   Fuzzing:
     runs-on: ubuntu-latest
     steps:
-    - run: sudo apt-get install -y libc++-dev libc++abi-dev
     - name: Build Fuzzers
       id: build
       uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
@@ -23,5 +18,11 @@ jobs:
       uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
       with:
         oss-fuzz-project-name: 'opensk'
-        fuzz-seconds: 6
+        fuzz-seconds: 600
         dry-run: false
+    - name: Upload Crash
+      uses: actions/upload-artifact@v4
+      if: failure() && steps.build.outcome == 'success'
+      with:
+        name: artifacts
+        path: ./out/artifacts
