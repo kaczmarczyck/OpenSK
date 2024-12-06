@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use super::status_code::Ctap2StatusCode;
-use crate::api::crypto::{ecdh, ecdsa, EC_FIELD_SIZE};
+use crate::api::crypto::{ecdh, ecdsa, hybrid, DILITHIUM_PUB_SIZE, EC_FIELD_SIZE};
 use crate::api::private_key::PrivateKey;
 use crate::ctap::status_code::CtapResult;
 use crate::env::{AesKey, Env};
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 #[cfg(feature = "fuzz")]
 use arbitrary::Arbitrary;
@@ -26,12 +27,16 @@ use core::convert::TryFrom;
 #[cfg(test)]
 use enum_iterator::IntoEnumIterator;
 use sk_cbor as cbor;
-use sk_cbor::{cbor_array_vec, cbor_map, cbor_map_options, destructure_cbor_map};
+use sk_cbor::{cbor_array_vec, cbor_bytes, cbor_map_options, destructure_cbor_map};
 
 // Used as the identifier for ECDSA in assertion signatures and COSE.
 pub const ES256_ALGORITHM: i64 = -7;
 #[cfg(feature = "ed25519")]
 pub const EDDSA_ALGORITHM: i64 = -8;
+// Used as the identifier for Hybrid in assertion signatures.
+// (numbers less than -65536 are reserved for private use)
+// TODO: Update this number later.
+pub const HYBRID_ALGORITHM: i64 = -65537;
 
 // https://www.w3.org/TR/webauthn/#dictdef-publickeycredentialrpentity
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,6 +517,7 @@ pub enum SignatureAlgorithm {
     Es256 = ES256_ALGORITHM as isize,
     #[cfg(feature = "ed25519")]
     Eddsa = EDDSA_ALGORITHM as isize,
+    Hybrid = HYBRID_ALGORITHM as isize,
     // This is the default for all numbers not covered above.
     // Unknown types should be ignored, instead of returning errors.
     Unknown = 0,
@@ -529,6 +535,7 @@ impl From<i64> for SignatureAlgorithm {
             ES256_ALGORITHM => SignatureAlgorithm::Es256,
             #[cfg(feature = "ed25519")]
             EDDSA_ALGORITHM => SignatureAlgorithm::Eddsa,
+            HYBRID_ALGORITHM => SignatureAlgorithm::Hybrid,
             _ => SignatureAlgorithm::Unknown,
         }
     }
@@ -721,6 +728,7 @@ pub struct CoseKey {
     algorithm: i64,
     key_type: i64,
     curve: i64,
+    dilithium_bytes: Option<Vec<u8>>,
 }
 
 impl CoseKey {
@@ -732,6 +740,8 @@ impl CoseKey {
     const EC2_KEY_TYPE: i64 = 2;
     #[cfg(feature = "ed25519")]
     const OKP_KEY_TYPE: i64 = 1;
+    // The key type changes for hybrid. The value is made up.
+    const HYBRID_KEY_TYPE: i64 = -65537;
     // The parameter behind map key -1.
     const P_256_CURVE: i64 = 1;
     #[cfg(feature = "ed25519")]
@@ -747,6 +757,7 @@ impl CoseKey {
             algorithm: CoseKey::ECDH_ALGORITHM,
             key_type: CoseKey::EC2_KEY_TYPE,
             curve: CoseKey::P_256_CURVE,
+            dilithium_bytes: None,
         }
     }
 
@@ -760,6 +771,24 @@ impl CoseKey {
             algorithm: ES256_ALGORITHM,
             key_type: CoseKey::EC2_KEY_TYPE,
             curve: CoseKey::P_256_CURVE,
+            dilithium_bytes: None,
+        }
+    }
+
+    pub fn from_hybrid_public_key(pk: impl hybrid::PublicKey) -> Self {
+        let mut ecdsa_x_bytes = [0; EC_FIELD_SIZE];
+        let mut ecdsa_y_bytes = [0; EC_FIELD_SIZE];
+        pk.ecdsa_to_coordinates(&mut ecdsa_x_bytes, &mut ecdsa_y_bytes);
+        let mut dilithium_bytes = vec![0; DILITHIUM_PUB_SIZE];
+        let bytes_ref = array_mut_ref!(dilithium_bytes, 0, DILITHIUM_PUB_SIZE);
+        pk.dilithium_to_bytes(bytes_ref);
+        CoseKey {
+            x_bytes: ecdsa_x_bytes,
+            y_bytes: ecdsa_y_bytes,
+            key_type: CoseKey::EC2_KEY_TYPE,
+            curve: CoseKey::P_256_CURVE,
+            algorithm: ES256_ALGORITHM,
+            dilithium_bytes: Some(dilithium_bytes),
         }
     }
 
@@ -773,6 +802,7 @@ impl CoseKey {
             algorithm,
             key_type,
             curve,
+            dilithium_bytes: _,
         } = self;
 
         // Since algorithm can be used for different COSE key types, we check
@@ -806,6 +836,7 @@ impl CoseKey {
             algorithm: CoseKey::ECDH_ALGORITHM,
             key_type: CoseKey::EC2_KEY_TYPE,
             curve: CoseKey::P_256_CURVE,
+            dilithium_bytes: None,
         }
     }
 }
@@ -823,6 +854,7 @@ impl TryFrom<cbor::Value> for CoseKey {
                 -1 => curve,
                 -2 => x_bytes,
                 -3 => y_bytes,
+                -4 => dilithium_bytes,
             } = extract_map(cbor_value)?;
         }
 
@@ -843,9 +875,22 @@ impl TryFrom<cbor::Value> for CoseKey {
             return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_ALGORITHM);
         }
         let key_type = extract_integer(ok_or_missing(key_type)?)?;
-        if key_type != CoseKey::EC2_KEY_TYPE {
+        if key_type != CoseKey::EC2_KEY_TYPE && key_type != CoseKey::HYBRID_KEY_TYPE {
             return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_ALGORITHM);
         }
+
+        let parsed_dilithium_bytes = if key_type == CoseKey::EC2_KEY_TYPE {
+            if dilithium_bytes.is_some() {
+                return Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER);
+            }
+            None
+        } else {
+            let dilithium_bytes = extract_byte_string(ok_or_missing(dilithium_bytes)?)?;
+            if dilithium_bytes.len() != dilithium::params::PK_SIZE_PACKED {
+                return Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER);
+            }
+            Some(dilithium_bytes)
+        };
 
         Ok(CoseKey {
             x_bytes: *array_ref![x_bytes.as_slice(), 0, EC_FIELD_SIZE],
@@ -853,6 +898,7 @@ impl TryFrom<cbor::Value> for CoseKey {
             algorithm,
             key_type,
             curve,
+            dilithium_bytes: parsed_dilithium_bytes,
         })
     }
 }
@@ -865,14 +911,16 @@ impl From<CoseKey> for cbor::Value {
             algorithm,
             key_type,
             curve,
+            dilithium_bytes,
         } = cose_key;
 
-        cbor_map! {
-            1 => key_type,
-            3 => algorithm,
-            -1 => curve,
-            -2 => x_bytes,
-            -3 => y_bytes,
+        cbor_map_options! {
+            1 => Some(key_type),
+            3 => Some(algorithm),
+            -1 => Some(curve),
+            -2 => Some(cbor_bytes!(x_bytes.to_vec())),
+            -3 => Some(cbor_bytes!(y_bytes.to_vec())),
+            -4 => dilithium_bytes.map(|b| cbor_bytes!(b)),
         }
     }
 }
@@ -886,6 +934,7 @@ impl From<ed25519_compact::PublicKey> for CoseKey {
             key_type: CoseKey::OKP_KEY_TYPE,
             curve: CoseKey::ED25519_CURVE,
             algorithm: EDDSA_ALGORITHM,
+            dilithium_bytes: None,
         }
     }
 }
@@ -1200,7 +1249,7 @@ mod test {
     use crate::env::test::TestEnv;
     use crate::env::{EcdhPk, EcdsaPk, Env};
     use cbor::{
-        cbor_array, cbor_bool, cbor_bytes, cbor_bytes_lit, cbor_false, cbor_int, cbor_null,
+        cbor_array, cbor_bool, cbor_bytes_lit, cbor_false, cbor_int, cbor_map, cbor_null,
         cbor_text, cbor_unsigned,
     };
 

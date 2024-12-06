@@ -30,10 +30,11 @@ use libtock_drivers::timer::{Timer, Timestamp};
 use libtock_runtime::{set_main, stack_size, TockSyscalls};
 use opensk::api::crypto::aes256::Aes256;
 use opensk::api::crypto::ecdsa::SecretKey as _;
+use opensk::api::crypto::hybrid::SecretKey as _;
 use opensk::api::crypto::sha256::Sha256;
-use opensk::env::{AesKey, EcdsaSk, Sha};
+use opensk::env::{AesKey, EcdsaSk, HybridSk, Sha};
 
-stack_size! {0x2000}
+stack_size! {0x11800}
 set_main! {main}
 
 type Syscalls = TockSyscalls;
@@ -49,6 +50,23 @@ fn main() {
 
     writeln!(console, "****************************************").unwrap();
     writeln!(console, "Clock frequency: {:?} Hz", timer.clock_frequency()).unwrap();
+
+    // Hybrid
+    bench(&mut console, &timer, "Hybrid::SecretKey::random", || {
+        HybridSk::<TockEnv<Syscalls>>::random(&mut rng);
+    });
+    let sk = HybridSk::<TockEnv<Syscalls>>::random(&mut rng);
+    bench(
+        &mut console,
+        &timer,
+        "Hybrid::SecretKey::public_key",
+        || {
+            black_box(sk.public_key());
+        },
+    );
+    bench(&mut console, &timer, "Hybrid::SecretKey::sign", || {
+        sk.sign(&[]);
+    });
 
     // AES
     bench(&mut console, &timer, "Aes256::new", || {

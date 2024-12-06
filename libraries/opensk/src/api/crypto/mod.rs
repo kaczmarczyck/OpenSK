@@ -15,6 +15,7 @@
 pub mod aes256;
 pub mod ecdh;
 pub mod ecdsa;
+pub mod hybrid;
 #[cfg(feature = "rust_crypto")]
 pub mod rust_crypto;
 #[cfg(not(feature = "rust_crypto"))]
@@ -30,6 +31,7 @@ use self::ecdh::Ecdh;
 use self::ecdsa::Ecdsa;
 use self::hkdf256::Hkdf256;
 use self::hmac256::Hmac256;
+use self::hybrid::Hybrid;
 use self::sha256::Sha256;
 
 /// The size of a serialized ECDSA signature.
@@ -43,6 +45,12 @@ pub const EC_FIELD_SIZE: usize = 32;
 
 /// The size of a serialized ECDSA signature.
 pub const EC_SIGNATURE_SIZE: usize = 2 * EC_FIELD_SIZE;
+
+/// The size of a serialized Hybrid private key.
+pub const HYBRID_SIZE: usize = EC_FIELD_SIZE + dilithium::params::SEEDBYTES;
+
+/// The size of a serialized Dilithium public key.
+pub const DILITHIUM_PUB_SIZE: usize = dilithium::params::PK_SIZE_PACKED;
 
 /// The size in bytes of a SHA256.
 pub const HASH_SIZE: usize = 32;
@@ -60,6 +68,7 @@ pub trait Crypto {
     type Aes256: Aes256;
     type Ecdh: Ecdh;
     type Ecdsa: Ecdsa;
+    type Hybrid: Hybrid;
     type Sha256: Sha256;
     type Hmac256: Hmac256;
     type Hkdf256: Hkdf256;
@@ -71,6 +80,7 @@ mod test {
     use super::*;
     use crate::api::crypto::ecdh::{PublicKey as _, SecretKey as _, SharedSecret};
     use crate::api::crypto::ecdsa::{PublicKey as _, SecretKey as _, Signature};
+    use crate::api::crypto::hybrid::{PublicKey as _, SecretKey as _};
     use crate::env::test::TestEnv;
     use crate::env::Env;
     use core::convert::TryFrom;
@@ -152,6 +162,16 @@ mod test {
         let mut new_bytes = [0; EC_SIGNATURE_SIZE];
         new_signature.to_slice(&mut new_bytes);
         assert_eq!(signature_bytes, new_bytes);
+    }
+
+    #[test]
+    fn test_hybrid_sign_verify() {
+        let mut env = TestEnv::default();
+        let private_key = SoftwareHybridSecretKey::random(env.rng());
+        let public_key = private_key.public_key();
+        let message = [0x12, 0x34, 0x56, 0x78];
+        let signature = private_key.sign(&message);
+        assert!(public_key.verify(&message, &signature));
     }
 
     #[test]

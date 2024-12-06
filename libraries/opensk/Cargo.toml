@@ -14,6 +14,7 @@ rust-version = "1.66"
 [dependencies]
 sk-cbor = { path = "../cbor" }
 crypto = { path = "../crypto" }
+dilithium = { path = "../../third_party/dilithium" }
 persistent_store = { path = "../persistent_store" }
 byteorder = { version = "1", default-features = false }
 arrayref = "0.3.6"

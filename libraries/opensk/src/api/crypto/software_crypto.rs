@@ -17,8 +17,8 @@ use crate::api::crypto::hkdf256::Hkdf256;
 use crate::api::crypto::hmac256::Hmac256;
 use crate::api::crypto::sha256::Sha256;
 use crate::api::crypto::{
-    ecdh, ecdsa, Crypto, AES_BLOCK_SIZE, AES_KEY_SIZE, EC_FIELD_SIZE, EC_SIGNATURE_SIZE, HASH_SIZE,
-    HMAC_KEY_SIZE, TRUNCATED_HMAC_SIZE,
+    ecdh, ecdsa, hybrid, Crypto, AES_BLOCK_SIZE, AES_KEY_SIZE, DILITHIUM_PUB_SIZE, EC_FIELD_SIZE,
+    EC_SIGNATURE_SIZE, HASH_SIZE, HMAC_KEY_SIZE, HYBRID_SIZE, TRUNCATED_HMAC_SIZE,
 };
 use crate::api::rng::Rng;
 use alloc::vec::Vec;
@@ -45,11 +45,13 @@ thread_local! {
 pub struct SoftwareCrypto;
 pub struct SoftwareEcdh;
 pub struct SoftwareEcdsa;
+pub struct SoftwareHybrid;
 
 impl Crypto for SoftwareCrypto {
     type Aes256 = SoftwareAes256;
     type Ecdh = SoftwareEcdh;
     type Ecdsa = SoftwareEcdsa;
+    type Hybrid = SoftwareHybrid;
     type Sha256 = SoftwareSha256;
     type Hmac256 = SoftwareHmac256;
     type Hkdf256 = SoftwareHkdf256;
@@ -189,6 +191,139 @@ impl ecdsa::Signature for SoftwareEcdsaSignature {
 
     fn to_der(&self) -> Vec<u8> {
         self.signature.to_asn1_der()
+    }
+}
+
+impl hybrid::Hybrid for SoftwareHybrid {
+    type SecretKey = SoftwareHybridSecretKey;
+    type PublicKey = SoftwareHybridPublicKey;
+    type Signature = SoftwareHybridSignature;
+}
+
+// A label generated uniformly at random from the output space of SHA256.
+const LABEL: [u8; 32] = [
+    43, 253, 32, 250, 19, 51, 24, 237, 138, 49, 47, 182, 4, 194, 133, 183, 177, 218, 115, 58, 92,
+    117, 45, 172, 156, 5, 214, 176, 248, 103, 55, 216,
+];
+
+fn ecdsa_input(message: &[u8]) -> Vec<u8> {
+    let mut input = LABEL.to_vec();
+    input.extend(message);
+    input
+}
+
+fn dilithium_input(message: &[u8], ecdsa_sign: &crypto::ecdsa::Signature) -> Vec<u8> {
+    let mut input = LABEL.to_vec();
+    input.extend(message);
+    input.extend(ecdsa_sign.to_asn1_der());
+    input
+}
+
+pub struct SoftwareHybridSecretKey {
+    ecdsa_key: crypto::ecdsa::SecKey,
+    dilithium_seed: [u8; dilithium::params::SEEDBYTES],
+}
+
+impl hybrid::SecretKey for SoftwareHybridSecretKey {
+    type PublicKey = SoftwareHybridPublicKey;
+    type Signature = SoftwareHybridSignature;
+
+    fn random(rng: &mut impl Rng) -> Self {
+        let ecdsa_key = crypto::ecdsa::SecKey::gensk(rng);
+        let mut dilithium_seed = [0u8; dilithium::params::SEEDBYTES];
+        rng.fill_bytes(&mut dilithium_seed);
+        Self {
+            ecdsa_key,
+            dilithium_seed,
+        }
+    }
+
+    fn from_slice(bytes: &[u8; HYBRID_SIZE]) -> Option<Self> {
+        let ecdsa_bytes = array_ref!(bytes, 0, EC_FIELD_SIZE);
+        let ecdsa_key = crypto::ecdsa::SecKey::from_bytes(ecdsa_bytes)?;
+        let dilithium_seed = *array_ref!(bytes, EC_FIELD_SIZE, dilithium::params::SEEDBYTES);
+
+        Some(Self {
+            ecdsa_key,
+            dilithium_seed,
+        })
+    }
+
+    fn public_key(&self) -> Self::PublicKey {
+        let ecdsa_pk = self.ecdsa_key.genpk();
+        let (_, dilithium_pk) =
+            dilithium::sign::SecKey::gensk_with_pk_from_seed(&self.dilithium_seed);
+        Self::PublicKey {
+            ecdsa_pk,
+            dilithium_pk,
+        }
+    }
+
+    fn sign(&self, message: &[u8]) -> Self::Signature {
+        let ecdsa_signature = self
+            .ecdsa_key
+            .sign_rfc6979::<crypto::sha256::Sha256>(&ecdsa_input(message));
+        let dilithium_sk = dilithium::sign::SecKey::gensk_from_seed(&self.dilithium_seed);
+        // This wastes some stack, we could revert the Dilithium API to take a &mut [u8].
+        let dilithium_signature = dilithium_sk
+            .sign(&dilithium_input(message, &ecdsa_signature))
+            .to_vec();
+        Self::Signature {
+            ecdsa_signature,
+            dilithium_signature,
+        }
+    }
+
+    fn to_slice(&self, bytes: &mut [u8; HYBRID_SIZE]) {
+        let ecdsa_bytes = array_mut_ref!(bytes, 0, EC_FIELD_SIZE);
+        self.ecdsa_key.to_bytes(ecdsa_bytes);
+        let dilithium_bytes = array_mut_ref!(bytes, EC_FIELD_SIZE, dilithium::params::SEEDBYTES);
+        dilithium_bytes.copy_from_slice(&self.dilithium_seed);
+    }
+}
+
+pub struct SoftwareHybridPublicKey {
+    ecdsa_pk: crypto::ecdsa::PubKey,
+    dilithium_pk: dilithium::sign::PubKey,
+}
+
+impl hybrid::PublicKey for SoftwareHybridPublicKey {
+    type Signature = SoftwareHybridSignature;
+
+    fn verify(&self, message: &[u8], signature: &Self::Signature) -> bool {
+        self.ecdsa_pk.verify_vartime::<crypto::sha256::Sha256>(
+            &ecdsa_input(message),
+            &signature.ecdsa_signature,
+        ) && self.dilithium_pk.verify(
+            &dilithium_input(message, &signature.ecdsa_signature),
+            array_ref!(
+                signature.dilithium_signature,
+                0,
+                dilithium::params::SIG_SIZE_PACKED
+            ),
+        )
+    }
+
+    fn ecdsa_to_coordinates(&self, x: &mut [u8; EC_FIELD_SIZE], y: &mut [u8; EC_FIELD_SIZE]) {
+        self.ecdsa_pk.to_coordinates(x, y);
+    }
+
+    fn dilithium_to_bytes(&self, bytes: &mut [u8; DILITHIUM_PUB_SIZE]) {
+        self.dilithium_pk.to_bytes(bytes);
+    }
+}
+
+pub struct SoftwareHybridSignature {
+    ecdsa_signature: crypto::ecdsa::Signature,
+    dilithium_signature: Vec<u8>,
+}
+
+impl hybrid::Signature for SoftwareHybridSignature {
+    fn into_der(self) -> Vec<u8> {
+        let mut bytes = self.ecdsa_signature.to_asn1_der();
+        bytes.reserve_exact(dilithium::params::SIG_SIZE_PACKED);
+        bytes.extend(self.dilithium_signature);
+        bytes
     }
 }
 

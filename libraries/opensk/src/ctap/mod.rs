@@ -120,10 +120,16 @@ pub const EDDSA_CRED_PARAM: PublicKeyCredentialParameter = PublicKeyCredentialPa
     alg: SignatureAlgorithm::Eddsa,
 };
 
+pub const HYBRID_CRED_PARAM: PublicKeyCredentialParameter = PublicKeyCredentialParameter {
+    cred_type: PublicKeyCredentialType::PublicKey,
+    alg: SignatureAlgorithm::Hybrid,
+};
+
 const SUPPORTED_CRED_PARAMS: &[PublicKeyCredentialParameter] = &[
     ES256_CRED_PARAM,
     #[cfg(feature = "ed25519")]
     EDDSA_CRED_PARAM,
+    HYBRID_CRED_PARAM,
 ];
 
 fn get_preferred_cred_param(
@@ -930,11 +936,10 @@ impl<E: Env> CtapState<E> {
 
         let mut auth_data = self.generate_auth_data(env, &rp_id_hash, flags)?;
         auth_data.extend(env.customization().aaguid());
-        // The length is fixed to 0x20 or 0x80 and fits one byte.
-        if credential_id.len() > 0xFF {
-            return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
-        }
-        auth_data.extend(vec![0x00, credential_id.len() as u8]);
+        auth_data.extend(vec![
+            (credential_id.len() >> 8) as u8,
+            credential_id.len() as u8,
+        ]);
         auth_data.extend(&credential_id);
         let public_cose_key = private_key.get_pub_key::<E>()?;
         cbor_write(cbor::Value::from(public_cose_key), &mut auth_data)?;
@@ -984,7 +989,16 @@ impl<E: Env> CtapState<E> {
                     Some(vec![certificate]),
                 )
             }
-            None => (private_key.sign_and_encode::<E>(&signature_data)?, None),
+            None => {
+                if matches!(algorithm, SignatureAlgorithm::Hybrid) {
+                    // We can't attest with Dilithium due to message size limits.
+                    // Instead, we cheat and use a new random ECDSA key.
+                    let new_ecdsa_key = EcdsaSk::<E>::random(env.rng());
+                    (new_ecdsa_key.sign(&signature_data).to_der(), None)
+                } else {
+                    (private_key.sign_and_encode::<E>(&signature_data)?, None)
+                }
+            }
         };
         let attestation_statement = PackedAttestationStatement {
             alg: SignatureAlgorithm::Es256 as i64,

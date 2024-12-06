@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::api::crypto::ecdsa::{SecretKey as _, Signature};
+use crate::api::crypto::ecdsa::{SecretKey as _, Signature as _};
+use crate::api::crypto::hybrid::{SecretKey as _, Signature as _};
+use crate::api::crypto::HYBRID_SIZE;
 use crate::ctap::crypto_wrapper::{aes256_cbc_decrypt, aes256_cbc_encrypt};
 use crate::ctap::data_formats::{extract_array, extract_byte_string, CoseKey, SignatureAlgorithm};
 use crate::ctap::secret::Secret;
 use crate::ctap::status_code::{Ctap2StatusCode, CtapResult};
-use crate::env::{AesKey, EcdsaSk, Env};
+use crate::env::{AesKey, EcdsaSk, Env, HybridSk};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -38,6 +40,8 @@ pub enum PrivateKey {
     Ecdsa(Secret<[u8; 32]>),
     #[cfg(feature = "ed25519")]
     Ed25519(ed25519_compact::SecretKey),
+    // TODO Make this a secret.
+    Hybrid([u8; HYBRID_SIZE]),
 }
 
 impl PrivateKey {
@@ -58,6 +62,11 @@ impl PrivateKey {
                 let mut bytes: Secret<[u8; 32]> = Secret::default();
                 env.rng().fill_bytes(bytes.deref_mut());
                 Self::new_ed25519_from_bytes(&*bytes).unwrap()
+            }
+            SignatureAlgorithm::Hybrid => {
+                let mut bytes = [0; HYBRID_SIZE];
+                HybridSk::<E>::random(env.rng()).to_slice(&mut bytes);
+                PrivateKey::Hybrid(bytes)
             }
             SignatureAlgorithm::Unknown => unreachable!(),
         }
@@ -88,6 +97,16 @@ impl PrivateKey {
         Some(Self::Ed25519(ed25519_compact::KeyPair::from_seed(seed).sk))
     }
 
+    /// Helper function that creates a private key of type Hybrid.
+    pub fn new_hybrid_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != HYBRID_SIZE {
+            return None;
+        }
+        let mut seed = [0; HYBRID_SIZE];
+        seed.copy_from_slice(bytes);
+        Some(PrivateKey::Hybrid(seed))
+    }
+
     /// Returns the ECDSA private key.
     pub fn ecdsa_key<E: Env>(&self) -> CtapResult<EcdsaSk<E>> {
         match self {
@@ -105,6 +124,9 @@ impl PrivateKey {
             }
             #[cfg(feature = "ed25519")]
             PrivateKey::Ed25519(ed25519_key) => CoseKey::from(ed25519_key.public_key()),
+            PrivateKey::Hybrid(bytes) => {
+                CoseKey::from_hybrid_public_key(hybrid_key_from_bytes::<E>(bytes)?.public_key())
+            }
         })
     }
 
@@ -114,6 +136,9 @@ impl PrivateKey {
             PrivateKey::Ecdsa(bytes) => ecdsa_key_from_bytes::<E>(bytes)?.sign(message).to_der(),
             #[cfg(feature = "ed25519")]
             PrivateKey::Ed25519(ed25519_key) => ed25519_key.sign(message, None).to_vec(),
+            PrivateKey::Hybrid(bytes) => {
+                hybrid_key_from_bytes::<E>(bytes)?.sign(message).into_der()
+            }
         })
     }
 
@@ -123,18 +148,30 @@ impl PrivateKey {
             PrivateKey::Ecdsa(_) => SignatureAlgorithm::Es256,
             #[cfg(feature = "ed25519")]
             PrivateKey::Ed25519(_) => SignatureAlgorithm::Eddsa,
+            PrivateKey::Hybrid(_) => SignatureAlgorithm::Hybrid,
         }
     }
 
     /// Writes the key bytes.
     pub fn to_bytes(&self) -> Secret<[u8]> {
-        let mut bytes = Secret::new(32);
         match self {
-            PrivateKey::Ecdsa(key_bytes) => bytes.copy_from_slice(key_bytes.deref()),
+            PrivateKey::Ecdsa(key_bytes) => {
+                let mut bytes = Secret::new(32);
+                bytes.copy_from_slice(key_bytes.deref());
+                bytes
+            }
             #[cfg(feature = "ed25519")]
-            PrivateKey::Ed25519(ed25519_key) => bytes.copy_from_slice(ed25519_key.seed().deref()),
+            PrivateKey::Ed25519(ed25519_key) => {
+                let mut bytes = Secret::new(32);
+                bytes.copy_from_slice(ed25519_key.seed().deref());
+                bytes
+            }
+            PrivateKey::Hybrid(key_bytes) => {
+                let mut bytes = Secret::new(HYBRID_SIZE);
+                bytes.copy_from_slice(key_bytes);
+                bytes
+            }
         }
-        bytes
     }
 
     pub fn to_cbor<E: Env>(
@@ -163,6 +200,8 @@ impl PrivateKey {
             #[cfg(feature = "ed25519")]
             SignatureAlgorithm::Eddsa => PrivateKey::new_ed25519_from_bytes(&key_bytes)
                 .ok_or(Ctap2StatusCode::CTAP2_ERR_INVALID_CBOR),
+            SignatureAlgorithm::Hybrid => PrivateKey::new_hybrid_from_bytes(&key_bytes)
+                .ok_or(Ctap2StatusCode::CTAP2_ERR_INVALID_CBOR),
             _ => Err(Ctap2StatusCode::CTAP2_ERR_INVALID_CBOR),
         }
     }
@@ -170,6 +209,10 @@ impl PrivateKey {
 
 fn ecdsa_key_from_bytes<E: Env>(bytes: &[u8; 32]) -> CtapResult<EcdsaSk<E>> {
     EcdsaSk::<E>::from_slice(bytes).ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)
+}
+
+fn hybrid_key_from_bytes<E: Env>(bytes: &[u8; 64]) -> CtapResult<HybridSk<E>> {
+    HybridSk::<E>::from_slice(bytes).ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)
 }
 
 #[cfg(test)]
