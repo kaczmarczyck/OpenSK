@@ -315,6 +315,7 @@ pub struct AuthenticatorCredentialManagementResponse {
     pub total_credentials: Option<u64>,
     pub cred_protect: Option<CredentialProtectionPolicy>,
     pub large_blob_key: Option<Vec<u8>>,
+    pub third_party_payment: Option<bool>,
 }
 
 impl From<AuthenticatorCredentialManagementResponse> for cbor::Value {
@@ -331,6 +332,7 @@ impl From<AuthenticatorCredentialManagementResponse> for cbor::Value {
             total_credentials,
             cred_protect,
             large_blob_key,
+            third_party_payment,
         } = cred_management_response;
 
         cbor_map_options! {
@@ -345,6 +347,7 @@ impl From<AuthenticatorCredentialManagementResponse> for cbor::Value {
             0x09 => total_credentials,
             0x0A => cred_protect,
             0x0B => large_blob_key,
+            0x0C => third_party_payment,
         }
     }
 }
@@ -639,6 +642,7 @@ mod test {
             total_credentials: Some(2),
             cred_protect: Some(CredentialProtectionPolicy::UserVerificationOptional),
             large_blob_key: Some(vec![0xBB; 64]),
+            third_party_payment: Some(true),
         };
         let response_cbor: Option<cbor::Value> =
             ResponseData::AuthenticatorCredentialManagement(Some(cred_management_response)).into();
@@ -654,6 +658,7 @@ mod test {
             0x09 => 2,
             0x0A => 0x01,
             0x0B => vec![0xBB; 64],
+            0x0C => true,
         };
         assert_eq!(response_cbor, Some(expected_cbor));
     }

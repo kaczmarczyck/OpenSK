@@ -247,6 +247,16 @@ pub trait Persist {
         }
     }
 
+    /// Returns the persistent PIN/UV auth token if defined.
+    fn persistent_pin_uv_auth_token(&self) -> CtapResult<Option<Vec<u8>>> {
+        self.find(keys::PERSISTENT_PIN_UV_AUTH_TOKEN)
+    }
+
+    /// Sets the persistent PIN/UV auth token.
+    fn set_persistent_pin_uv_auth_token(&mut self, value: &[u8]) -> CtapResult<()> {
+        self.insert(keys::PERSISTENT_PIN_UV_AUTH_TOKEN, value)
+    }
+
     /// Sets the minimum PIN length.
     #[cfg(feature = "config_command")]
     fn set_min_pin_length(&mut self, min_pin_length: u8) -> CtapResult<()> {
@@ -500,7 +510,7 @@ pub trait Persist {
                 let cbor_value = cbor_read(&data)
                     .map_err(|_| Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
                 let template_info = TemplateInfo::try_from(cbor_value)?;
-                if &template_info.template_id == template_id {
+                if template_info.template_id == template_id {
                     return Ok(template_info.template_friendly_name);
                 }
             }

@@ -31,6 +31,7 @@ use crate::api::crypto::sha256::Sha256;
 use crate::api::customization::Customization;
 use crate::api::key_store::KeyStore;
 use crate::api::persist::Persist;
+use crate::api::rng::Rng;
 #[cfg(test)]
 use crate::env::EcdhSk;
 use crate::env::{Env, Hmac, Sha};
@@ -111,6 +112,7 @@ fn check_and_store_new_pin<E: Env>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(test, derive(IntoEnumIterator))]
 pub enum PinPermission {
     // All variants should use integers with a single bit set.
@@ -121,6 +123,7 @@ pub enum PinPermission {
     BioEnrollment = 0x08,
     LargeBlobWrite = 0x10,
     AuthenticatorConfiguration = 0x20,
+    CredentialManagementReadOnly = 0x40,
 }
 
 pub struct ClientPin<E: Env> {
@@ -272,6 +275,7 @@ impl<E: Env> ClientPin<E> {
 
         check_and_store_new_pin(env, &shared_secret, new_pin_enc)?;
         storage::reset_pin_retries(env)?;
+        reset_persistent_pin_uv_auth_token(env)?;
         Ok(())
     }
 
@@ -305,6 +309,7 @@ impl<E: Env> ClientPin<E> {
         check_and_store_new_pin(env, &shared_secret, new_pin_enc)?;
         self.pin_protocol_v1.reset_pin_uv_auth_token(env);
         self.pin_protocol_v2.reset_pin_uv_auth_token(env);
+        reset_persistent_pin_uv_auth_token(env)?;
         Ok(())
     }
 
@@ -375,6 +380,33 @@ impl<E: Env> ClientPin<E> {
 
         if permissions == 0 {
             return Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER);
+        }
+        if permissions == PinPermission::CredentialManagementReadOnly as u8 {
+            let internal_retry = env.customization().preferred_platform_uv_attempts() == 1;
+            perform_built_in_uv(env, channel, internal_retry)?;
+
+            let shared_secret = self.get_shared_secret(pin_uv_auth_protocol, key_agreement)?;
+            if env.persist().has_force_pin_change()? {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID);
+            }
+
+            self.pin_protocol_v1.reset_pin_uv_auth_token(env);
+            self.pin_protocol_v2.reset_pin_uv_auth_token(env);
+            self.pin_uv_auth_token_state.stop_using_pin_uv_auth_token();
+
+            let persistent_token = get_persistent_token_and_set_pcmr(env, pin_uv_auth_protocol)?;
+            let encrypted_token = shared_secret.encrypt(env, &persistent_token)?;
+
+            return Ok(AuthenticatorClientPinResponse {
+                key_agreement: None,
+                pin_uv_auth_token: Some(encrypted_token),
+                retries: None,
+                power_cycle_state: None,
+                uv_retries: None,
+            });
+        }
+        if permissions & PinPermission::CredentialManagementReadOnly as u8 > 0 {
+            return Err(Ctap2StatusCode::CTAP2_ERR_UNAUTHORIZED_PERMISSION);
         }
         // Since credMgmt, uvBioEnroll and largeBlobs are always true in the options,
         // we only have to check uvAcfg for step 3.4 in CTAP 2.2.
@@ -461,6 +493,37 @@ impl<E: Env> ClientPin<E> {
 
         if permissions == 0 {
             return Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER);
+        }
+        if permissions == PinPermission::CredentialManagementReadOnly as u8 {
+            let pin_uv_auth_protocol = client_pin_params.pin_uv_auth_protocol;
+            if storage::pin_retries(env)? == 0 {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PIN_BLOCKED);
+            }
+            let key_agreement = ok_or_missing(client_pin_params.key_agreement)?;
+            let pin_hash_enc = ok_or_missing(client_pin_params.pin_hash_enc)?;
+            let shared_secret = self.get_shared_secret(pin_uv_auth_protocol, key_agreement)?;
+            self.verify_pin_hash_enc(env, pin_uv_auth_protocol, &shared_secret, pin_hash_enc)?;
+            if env.persist().has_force_pin_change()? {
+                return Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID);
+            }
+
+            self.pin_protocol_v1.reset_pin_uv_auth_token(env);
+            self.pin_protocol_v2.reset_pin_uv_auth_token(env);
+            self.pin_uv_auth_token_state.stop_using_pin_uv_auth_token();
+
+            let persistent_token = get_persistent_token_and_set_pcmr(env, pin_uv_auth_protocol)?;
+            let encrypted_token = shared_secret.encrypt(env, &persistent_token)?;
+
+            return Ok(AuthenticatorClientPinResponse {
+                key_agreement: None,
+                pin_uv_auth_token: Some(encrypted_token),
+                retries: None,
+                power_cycle_state: None,
+                uv_retries: None,
+            });
+        }
+        if permissions & PinPermission::CredentialManagementReadOnly as u8 > 0 {
+            return Err(Ctap2StatusCode::CTAP2_ERR_UNAUTHORIZED_PERMISSION);
         }
         // Since credMgmt, uvBioEnroll and largeBlobs are always true in the options,
         // and noMcGaPermissionsWithClientPin and noMcGaPermissionsWithClientPin are both false,
@@ -582,6 +645,11 @@ impl<E: Env> ClientPin<E> {
             salt_auth,
             pin_uv_auth_protocol,
         } = hmac_secret_input;
+        if pin_uv_auth_protocol == PinUvAuthProtocol::V1
+            && !env.customization().allows_pin_protocol_v1()
+        {
+            return Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER);
+        }
         let shared_secret = self
             .get_pin_protocol(pin_uv_auth_protocol)
             .decapsulate(key_agreement, pin_uv_auth_protocol)?;
@@ -700,6 +768,90 @@ impl<E: Env> ClientPin<E> {
             pin_uv_auth_token_state,
         }
     }
+
+    #[cfg(test)]
+    pub fn reset_token_state_for_test(&mut self, env: &mut E, user_verified: bool) {
+        self.pin_uv_auth_token_state.set_permissions(0xFF);
+        self.pin_uv_auth_token_state
+            .begin_using_pin_uv_auth_token(env, user_verified);
+    }
+
+    /// Verifies the PIN/UV auth token, supporting either the persistent token (with pcmr) or
+    ///
+    /// falling back to the ephemeral token (with CredentialManagement).
+    /// Returns Ok(true) if persistent token was used, Ok(false) if ephemeral token was used.
+    #[allow(clippy::collapsible_if)]
+    pub fn verify_pin_uv_auth_token_with_pcmr(
+        &self,
+        env: &mut E,
+        hmac_contents: &[u8],
+        pin_uv_auth_param: &[u8],
+        pin_uv_auth_protocol: PinUvAuthProtocol,
+    ) -> CtapResult<bool> {
+        if let Some(data) = env.persist().persistent_pin_uv_auth_token()? {
+            if data.len() == 66 {
+                let (token, permissions) = match pin_uv_auth_protocol {
+                    PinUvAuthProtocol::V1 => (array_ref![data, 0, 32], data[32]),
+                    PinUvAuthProtocol::V2 => (array_ref![data, 33, 32], data[65]),
+                };
+                if (permissions & PinPermission::CredentialManagementReadOnly as u8) != 0 {
+                    let verification_result = verify_pin_uv_auth_token::<E>(
+                        token,
+                        hmac_contents,
+                        pin_uv_auth_param,
+                        pin_uv_auth_protocol,
+                    );
+                    if verification_result.is_ok() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        self.has_permission(PinPermission::CredentialManagement)?;
+        self.verify_pin_uv_auth_token(hmac_contents, pin_uv_auth_param, pin_uv_auth_protocol)?;
+        Ok(false)
+    }
+}
+
+/// Generates random V1 and V2 persistent tokens with 0 permission bytes and stores them.
+pub fn reset_persistent_pin_uv_auth_token<E: Env>(env: &mut E) -> CtapResult<()> {
+    let mut data = [0u8; 66];
+    let token_v1 = env.rng().gen_uniform_u8x32();
+    let token_v2 = env.rng().gen_uniform_u8x32();
+    data[0..32].copy_from_slice(&token_v1);
+    data[32] = 0;
+    data[33..65].copy_from_slice(&token_v2);
+    data[65] = 0;
+    env.persist().set_persistent_pin_uv_auth_token(&data)
+}
+
+/// Retrieves the persistent token, sets the pcmr permission bit, saves it back,
+///
+/// and returns the 32-byte token.
+pub fn get_persistent_token_and_set_pcmr<E: Env>(
+    env: &mut E,
+    pin_uv_auth_protocol: PinUvAuthProtocol,
+) -> CtapResult<[u8; PIN_TOKEN_LENGTH]> {
+    let mut data = env
+        .persist()
+        .persistent_pin_uv_auth_token()?
+        .ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+    if data.len() != 66 {
+        return Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR);
+    }
+    let token = match pin_uv_auth_protocol {
+        PinUvAuthProtocol::V1 => {
+            data[32] |= PinPermission::CredentialManagementReadOnly as u8;
+            *array_ref![data, 0, 32]
+        }
+        PinUvAuthProtocol::V2 => {
+            data[65] |= PinPermission::CredentialManagementReadOnly as u8;
+            *array_ref![data, 33, 32]
+        }
+    };
+    env.persist().set_persistent_pin_uv_auth_token(&data)?;
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -1863,7 +2015,7 @@ mod test {
         );
         let mut env = TestEnv::default();
         set_standard_pin(&mut env);
-        params.permissions = Some(0xFF);
+        params.permissions = Some(0xFF & !(PinPermission::CredentialManagementReadOnly as u8));
 
         assert!(
             client_pin
@@ -1875,7 +2027,12 @@ mod test {
                 client_pin
                     .pin_uv_auth_token_state
                     .has_permission(permission),
-                Ok(())
+                match permission {
+                    PinPermission::CredentialManagementReadOnly => {
+                        Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID)
+                    }
+                    _ => Ok(()),
+                }
             );
         }
         assert_eq!(
@@ -1913,7 +2070,7 @@ mod test {
         );
         let mut env = TestEnv::default();
         set_standard_pin(&mut env);
-        params.permissions = Some(0xFF);
+        params.permissions = Some(0xFF & !(PinPermission::CredentialManagementReadOnly as u8));
         #[cfg(not(feature = "config_command"))]
         {
             params.permissions = params
@@ -1931,7 +2088,12 @@ mod test {
                 client_pin
                     .pin_uv_auth_token_state
                     .has_permission(permission),
-                Ok(())
+                match permission {
+                    PinPermission::CredentialManagementReadOnly => {
+                        Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID)
+                    }
+                    _ => Ok(()),
+                }
             );
         }
         assert_eq!(client_pin.check_user_verified_flag(), Ok(()));
@@ -1953,5 +2115,85 @@ mod test {
             client_pin.check_user_verified_flag(),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID)
         );
+    }
+
+    #[test]
+    fn test_persistent_pin_uv_auth_token() {
+        let mut env = TestEnv::default();
+        let client_pin = ClientPin::new(&mut env);
+
+        // Initially no token is set.
+        assert!(
+            env.persist()
+                .persistent_pin_uv_auth_token()
+                .unwrap()
+                .is_none()
+        );
+
+        // Generate the persistent token.
+        reset_persistent_pin_uv_auth_token(&mut env).unwrap();
+        let raw_token = env
+            .persist()
+            .persistent_pin_uv_auth_token()
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw_token.len(), 66);
+
+        // Get V1 persistent token and set pcmr.
+        let token_v1 = get_persistent_token_and_set_pcmr(&mut env, PinUvAuthProtocol::V1).unwrap();
+        assert_eq!(token_v1, raw_token[..32]);
+
+        // Verify verify_pin_uv_auth_token_with_pcmr using V1 token.
+        let data = b"some data to authenticate";
+        let hmac_v1 = authenticate_pin_uv_auth_token(&token_v1, data, PinUvAuthProtocol::V1);
+        let result_v1 = client_pin
+            .verify_pin_uv_auth_token_with_pcmr(&mut env, data, &hmac_v1, PinUvAuthProtocol::V1)
+            .unwrap();
+        assert!(result_v1); // Verified using persistent token.
+
+        // Get V2 persistent token and set pcmr.
+        let token_v2 = get_persistent_token_and_set_pcmr(&mut env, PinUvAuthProtocol::V2).unwrap();
+        assert_eq!(token_v2, raw_token[33..65]);
+
+        // Verify verify_pin_uv_auth_token_with_pcmr using V2 token.
+        let hmac_v2 = authenticate_pin_uv_auth_token(&token_v2, data, PinUvAuthProtocol::V2);
+        let result_v2 = client_pin
+            .verify_pin_uv_auth_token_with_pcmr(&mut env, data, &hmac_v2, PinUvAuthProtocol::V2)
+            .unwrap();
+        assert!(result_v2); // Verified using persistent token.
+
+        // Now test fallback/ephemeral token when verify_pin_uv_auth_token_with_pcmr is called with an ephemeral token.
+        // First set standard pin to enable ephemeral PUAT.
+        set_standard_pin(&mut env);
+        let key_agreement_key = EcdhSk::<TestEnv>::random(env.rng());
+        let pin_uv_auth_token = [0x99; 32];
+        let mut client_pin2 = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            PinUvAuthProtocol::V2,
+        );
+        // Let's grant CredentialManagement permission on client_pin2 so fallback checks pass.
+        client_pin2
+            .pin_uv_auth_token_state
+            .begin_using_pin_uv_auth_token(&mut env, false);
+        client_pin2
+            .pin_uv_auth_token_state
+            .set_permissions(PinPermission::CredentialManagement as u8);
+        client_pin2
+            .pin_uv_auth_token_state
+            .set_permissions_rp_id(None);
+
+        let hmac_ephemeral =
+            authenticate_pin_uv_auth_token(&pin_uv_auth_token, data, PinUvAuthProtocol::V2);
+        let result2 = client_pin2
+            .verify_pin_uv_auth_token_with_pcmr(
+                &mut env,
+                data,
+                &hmac_ephemeral,
+                PinUvAuthProtocol::V2,
+            )
+            .unwrap();
+        assert!(!result2); // Returns false because it used the ephemeral token fallback.
     }
 }
