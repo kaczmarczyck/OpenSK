@@ -252,6 +252,7 @@ impl Ctap1Command {
             rp_id_hash: application,
             cred_protect_policy: None,
             cred_blob: None,
+            third_party_payment: false,
         };
         let key_handle = env
             .key_store()
@@ -414,6 +415,7 @@ mod test {
             rp_id_hash,
             cred_protect_policy: None,
             cred_blob: None,
+            third_party_payment: false,
         };
         let key_handle = env.key_store().wrap_credential(credential_source).unwrap();
         (key_handle, rp_id_hash)
@@ -753,6 +755,7 @@ mod test {
             rp_id_hash,
             cred_protect_policy: Some(CredentialProtectionPolicy::UserVerificationRequired),
             cred_blob: None,
+            third_party_payment: false,
         };
         let key_handle = env.key_store().wrap_credential(credential_source).unwrap();
         let message =

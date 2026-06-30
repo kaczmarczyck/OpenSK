@@ -46,7 +46,7 @@ const MAX_USER_HANDLE_LENGTH: usize = 64;
 
 // CTAP specification (version 20190130) section 6.1
 #[derive(Debug, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub enum Command {
     AuthenticatorMakeCredential(AuthenticatorMakeCredentialParameters),
     AuthenticatorGetAssertion(AuthenticatorGetAssertionParameters),

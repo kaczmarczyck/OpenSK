@@ -85,6 +85,9 @@ make_partition! {
     /// Used to make sure that a Reset command completes once started.
     RESET_COMPLETION = 20;
 
+    /// Persistent PIN/UV auth token.
+    PERSISTENT_PIN_UV_AUTH_TOKEN = 21;
+
     /// Reserved for future credential-related objects.
     ///
     /// In particular, additional credentials could be added there by reducing the lower bound of

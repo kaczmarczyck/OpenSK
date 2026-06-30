@@ -47,6 +47,7 @@ pub struct CredentialSource {
     pub rp_id_hash: [u8; 32],
     pub cred_protect_policy: Option<CredentialProtectionPolicy>,
     pub cred_blob: Option<Vec<u8>>,
+    pub third_party_payment: bool,
 }
 
 /// CBOR map keys for serialized credential IDs.
@@ -55,6 +56,7 @@ enum CredentialSourceField {
     RpIdHash = 1,
     CredProtectPolicy = 2,
     CredBlob = 3,
+    ThirdPartyPayment = 4,
 }
 
 impl From<CredentialSourceField> for cbor::Value {
@@ -127,11 +129,13 @@ impl<T: Helper> KeyStore for T {
     /// stored server-side, this information is already available (unencrypted).
     fn wrap_credential(&mut self, credential: CredentialSource) -> Result<Vec<u8>, Error> {
         let mut payload = Vec::new();
+        let third_party_payment = credential.third_party_payment.then_some(true);
         let cbor = cbor_map_options! {
           CredentialSourceField::PrivateKey => credential.wrapped_private_key,
           CredentialSourceField::RpIdHash => credential.rp_id_hash,
           CredentialSourceField::CredProtectPolicy => credential.cred_protect_policy,
           CredentialSourceField::CredBlob => credential.cred_blob,
+          CredentialSourceField::ThirdPartyPayment => third_party_payment,
         };
         cbor_write(cbor, &mut payload).map_err(|_| Error)?;
         add_padding(&mut payload)?;
@@ -304,6 +308,7 @@ fn decrypt_cbor_credential_id<E: Env>(
           CredentialSourceField::RpIdHash => rp_id_hash,
           CredentialSourceField::CredProtectPolicy => cred_protect_policy,
           CredentialSourceField::CredBlob => cred_blob,
+          CredentialSourceField::ThirdPartyPayment => third_party_payment,
       } = extract_map(cbor_credential_source)?;
     }
     Ok(match (wrapped_private_key, rp_id_hash) {
@@ -317,11 +322,16 @@ fn decrypt_cbor_credential_id<E: Env>(
                 .transpose()
                 .map_err(|_| Error)?;
             let cred_blob = cred_blob.map(extract_byte_string).transpose()?;
+            let third_party_payment = third_party_payment
+                .map(extract_bool)
+                .transpose()?
+                .unwrap_or(false);
             Some(CredentialSource {
                 wrapped_private_key,
                 rp_id_hash: rp_id_hash.try_into().unwrap(),
                 cred_protect_policy,
                 cred_blob,
+                third_party_payment,
             })
         }
         _ => None,
@@ -330,6 +340,10 @@ fn decrypt_cbor_credential_id<E: Env>(
 
 fn extract_byte_string(cbor_value: cbor::Value) -> Result<Vec<u8>, Error> {
     cbor_value.extract_byte_string().ok_or(Error)
+}
+
+fn extract_bool(cbor_value: cbor::Value) -> Result<bool, Error> {
+    cbor_value.extract_bool().ok_or(Error)
 }
 
 fn extract_map(cbor_value: cbor::Value) -> Result<Vec<(cbor::Value, cbor::Value)>, Error> {
@@ -356,6 +370,7 @@ mod test {
             rp_id_hash: [0x55; 32],
             cred_protect_policy: Some(CredentialProtectionPolicy::UserVerificationOptional),
             cred_blob: Some(vec![0xAA; 32]),
+            third_party_payment: false,
         }
     }
 

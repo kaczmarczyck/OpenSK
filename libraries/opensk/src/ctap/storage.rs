@@ -30,6 +30,11 @@ use sk_cbor::cbor_array_vec;
 pub fn init(env: &mut impl Env) -> CtapResult<()> {
     env.persist().init()?;
     env.key_store().init()?;
+    if env.persist().pin_hash()?.is_some()
+        && env.persist().persistent_pin_uv_auth_token()?.is_none()
+    {
+        crate::ctap::client_pin::reset_persistent_pin_uv_auth_token(env)?;
+    }
     Ok(())
 }
 
@@ -431,6 +436,7 @@ mod test {
             user_icon: None,
             cred_blob: None,
             large_blob_key: None,
+            third_party_payment: false,
         }
     }
 
@@ -635,6 +641,7 @@ mod test {
             user_icon: None,
             cred_blob: None,
             large_blob_key: None,
+            third_party_payment: false,
         };
         assert_eq!(found_credential, Some(expected_credential));
     }
@@ -827,6 +834,7 @@ mod test {
             user_icon: Some(String::from("icon")),
             cred_blob: Some(vec![0xCB]),
             large_blob_key: Some(vec![0x1B]),
+            third_party_payment: false,
         };
         let serialized = serialize_credential(credential.clone()).unwrap();
         let reconstructed = deserialize_credential(&serialized).unwrap();

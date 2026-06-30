@@ -304,10 +304,12 @@ impl From<PublicKeyCredentialDescriptor> for cbor::Value {
 #[cfg_attr(feature = "fuzz", derive(Arbitrary))]
 pub struct MakeCredentialExtensions {
     pub hmac_secret: bool,
+    pub hmac_secret_mc: Option<GetAssertionHmacSecretInput>,
     pub cred_protect: Option<CredentialProtectionPolicy>,
     pub min_pin_length: bool,
     pub cred_blob: Option<Vec<u8>>,
     pub large_blob_key: Option<bool>,
+    pub third_party_payment: bool,
 }
 
 impl TryFrom<cbor::Value> for MakeCredentialExtensions {
@@ -321,10 +323,15 @@ impl TryFrom<cbor::Value> for MakeCredentialExtensions {
                 "hmac-secret" => hmac_secret,
                 "largeBlobKey" => large_blob_key,
                 "minPinLength" => min_pin_length,
+                "hmac-secret-mc" => hmac_secret_mc,
+                "thirdPartyPayment" => third_party_payment,
             } = extract_map(cbor_value)?;
         }
 
         let hmac_secret = hmac_secret.map_or(Ok(false), extract_bool)?;
+        let hmac_secret_mc = hmac_secret_mc
+            .map(GetAssertionHmacSecretInput::try_from)
+            .transpose()?;
         let cred_protect = cred_protect
             .map(CredentialProtectionPolicy::try_from)
             .transpose()?;
@@ -336,12 +343,15 @@ impl TryFrom<cbor::Value> for MakeCredentialExtensions {
         {
             return Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION);
         }
+        let third_party_payment = third_party_payment.map_or(Ok(false), extract_bool)?;
         Ok(Self {
             hmac_secret,
+            hmac_secret_mc,
             cred_protect,
             min_pin_length,
             cred_blob,
             large_blob_key,
+            third_party_payment,
         })
     }
 }
@@ -352,6 +362,7 @@ pub struct GetAssertionExtensions {
     pub hmac_secret: Option<GetAssertionHmacSecretInput>,
     pub cred_blob: bool,
     pub large_blob_key: Option<bool>,
+    pub third_party_payment: bool,
 }
 
 impl TryFrom<cbor::Value> for GetAssertionExtensions {
@@ -363,6 +374,7 @@ impl TryFrom<cbor::Value> for GetAssertionExtensions {
                 "credBlob" => cred_blob,
                 "hmac-secret" => hmac_secret,
                 "largeBlobKey" => large_blob_key,
+                "thirdPartyPayment" => third_party_payment,
             } = extract_map(cbor_value)?;
         }
 
@@ -376,10 +388,12 @@ impl TryFrom<cbor::Value> for GetAssertionExtensions {
         {
             return Err(Ctap2StatusCode::CTAP2_ERR_INVALID_OPTION);
         }
+        let third_party_payment = third_party_payment.map_or(Ok(false), extract_bool)?;
         Ok(Self {
             hmac_secret,
             cred_blob,
             large_blob_key,
+            third_party_payment,
         })
     }
 }
@@ -615,6 +629,7 @@ pub struct PublicKeyCredentialSource {
     pub user_icon: Option<String>,
     pub cred_blob: Option<Vec<u8>>,
     pub large_blob_key: Option<Vec<u8>>,
+    pub third_party_payment: bool,
 }
 
 // We serialize credentials for the persistent storage using CBOR maps. Each field of a credential
@@ -631,6 +646,7 @@ enum PublicKeyCredentialSourceField {
     CredBlob = 10,
     LargeBlobKey = 11,
     PrivateKey = 12,
+    ThirdPartyPayment = 13,
     // When a field is removed, its tag should be reserved and not used for new fields. We document
     // those reserved tags below.
     // Reserved tags:
@@ -670,6 +686,7 @@ impl TryFrom<cbor::Value> for PublicKeyCredentialSource {
                 PublicKeyCredentialSourceField::CredBlob => cred_blob,
                 PublicKeyCredentialSourceField::LargeBlobKey => large_blob_key,
                 PublicKeyCredentialSourceField::PrivateKey => wrapped_private_key,
+                PublicKeyCredentialSourceField::ThirdPartyPayment => third_party_payment,
             } = extract_map(cbor_value)?;
         }
 
@@ -686,6 +703,7 @@ impl TryFrom<cbor::Value> for PublicKeyCredentialSource {
         let cred_blob = cred_blob.map(extract_byte_string).transpose()?;
         let large_blob_key = large_blob_key.map(extract_byte_string).transpose()?;
         let wrapped_private_key = ok_or_missing(wrapped_private_key)?;
+        let third_party_payment = third_party_payment.map_or(Ok(false), extract_bool)?;
 
         // We don't return whether there were unknown fields in the CBOR value. This means that
         // deserialization is not injective. In particular deserialization is only an inverse of
@@ -710,6 +728,7 @@ impl TryFrom<cbor::Value> for PublicKeyCredentialSource {
             user_icon,
             cred_blob,
             large_blob_key,
+            third_party_payment,
         })
     }
 }
@@ -728,6 +747,7 @@ impl From<PublicKeyCredentialSource> for cbor::Value {
             PublicKeyCredentialSourceField::CredBlob => cred.cred_blob,
             PublicKeyCredentialSourceField::LargeBlobKey => cred.large_blob_key,
             PublicKeyCredentialSourceField::PrivateKey => cred.wrapped_private_key,
+            PublicKeyCredentialSourceField::ThirdPartyPayment => Some(cred.third_party_payment),
         }
     }
 }
@@ -1782,14 +1802,17 @@ mod test {
             "hmac-secret" => true,
             "largeBlobKey" => true,
             "minPinLength" => true,
+            "thirdPartyPayment" => true,
         };
         let extensions = MakeCredentialExtensions::try_from(cbor_extensions);
         let expected_extensions = MakeCredentialExtensions {
             hmac_secret: true,
+            hmac_secret_mc: None,
             cred_protect: Some(CredentialProtectionPolicy::UserVerificationRequired),
             min_pin_length: true,
             cred_blob: Some(vec![0xCB]),
             large_blob_key: Some(true),
+            third_party_payment: true,
         };
         assert_eq!(extensions, Ok(expected_extensions));
     }
@@ -1805,6 +1828,7 @@ mod test {
                 3 => vec![0x03; 16],
             },
             "largeBlobKey" => true,
+            "thirdPartyPayment" => true,
         };
         let extensions = GetAssertionExtensions::try_from(cbor_extensions);
         let expected_input = GetAssertionHmacSecretInput {
@@ -1817,6 +1841,7 @@ mod test {
             hmac_secret: Some(expected_input),
             cred_blob: true,
             large_blob_key: Some(true),
+            third_party_payment: true,
         };
         assert_eq!(extensions, Ok(expected_extensions));
     }
@@ -1833,6 +1858,7 @@ mod test {
                 4 => 2,
             },
             "largeBlobKey" => true,
+            "thirdPartyPayment" => false,
         };
         let extensions = GetAssertionExtensions::try_from(cbor_extensions);
         let expected_input = GetAssertionHmacSecretInput {
@@ -1845,6 +1871,7 @@ mod test {
             hmac_secret: Some(expected_input),
             cred_blob: true,
             large_blob_key: Some(true),
+            third_party_payment: false,
         };
         assert_eq!(extensions, Ok(expected_extensions));
         // TODO more tests, check default
@@ -2315,6 +2342,7 @@ mod test {
             user_icon: None,
             cred_blob: None,
             large_blob_key: None,
+            third_party_payment: false,
         };
         assert_eq!(
             PublicKeyCredentialSource::try_from(cbor::Value::from(credential.clone())),
@@ -2368,6 +2396,15 @@ mod test {
 
         let credential = PublicKeyCredentialSource {
             large_blob_key: Some(vec![0x1B]),
+            ..credential
+        };
+        assert_eq!(
+            PublicKeyCredentialSource::try_from(cbor::Value::from(credential.clone())),
+            Ok(credential.clone())
+        );
+
+        let credential = PublicKeyCredentialSource {
+            third_party_payment: true,
             ..credential
         };
         assert_eq!(
