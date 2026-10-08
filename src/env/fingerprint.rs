@@ -45,7 +45,7 @@ struct EnrollState {
 }
 
 struct IdentifyState {
-    identify: Identify,
+    identify: Option<Identify>,
 }
 
 impl Impl {
@@ -73,6 +73,7 @@ impl Impl {
 
 impl Fingerprint for Impl {
     fn prepare_enrollment(&mut self) -> CtapResult<()> {
+        self.cancel_enrollment()?;
         self.ensure_idle()?;
         let state = EnrollState {
             enroll: Enroll::new().map_err(convert)?,
@@ -119,20 +120,23 @@ impl Fingerprint for Impl {
     }
 
     fn cancel_enrollment(&mut self) -> CtapResult<()> {
-        let state = self
-            .take_enroll()
-            .ok_or(Ctap2StatusCode::CTAP2_ERR_NO_OPERATIONS)?;
-        state.enroll.abort().map_err(convert)
+        match self.take_enroll() {
+            Some(state) => state.enroll.abort().map_err(convert),
+            None => Ok(()),
+        }
     }
 
     fn remove_enrollment(&mut self, template_id: &[u8]) -> CtapResult<()> {
+        self.cancel_enrollment()?;
+        self.ensure_idle()?;
         delete_template(Some(template_id)).map_err(convert)
     }
 
     fn check_fingerprint_init(&mut self) -> CtapResult<()> {
+        self.cancel_enrollment()?;
         self.ensure_idle()?;
         let state = IdentifyState {
-            identify: Identify::new(None).map_err(convert)?,
+            identify: Some(Identify::new(None).map_err(convert)?),
         };
         self.0 = State::Identify(state);
         Ok(())
@@ -142,12 +146,17 @@ impl Fingerprint for Impl {
         let State::Identify(state) = &mut self.0 else {
             return Err(FingerprintCheckError::Other);
         };
-        let timeout = Timeout::new_ms(timeout_ms);
-        scheduling::wait_until(|| state.identify.is_done() || timeout.is_over());
-        if state.identify.is_done() {
-            let state = self.take_identify().ok_or(FingerprintCheckError::Other)?;
-            match state
+        let identify = match &mut state.identify {
+            Some(identify) => identify,
+            None => state
                 .identify
+                .insert(Identify::new(None).map_err(|_| FingerprintCheckError::Other)?),
+        };
+        let timeout = Timeout::new_ms(timeout_ms);
+        scheduling::wait_until(|| identify.is_done() || timeout.is_over());
+        if identify.is_done() {
+            let identify = state.identify.take().ok_or(FingerprintCheckError::Other)?;
+            match identify
                 .result()
                 .map_err(|_| FingerprintCheckError::Other)?
             {
@@ -160,7 +169,13 @@ impl Fingerprint for Impl {
     }
 
     fn check_fingerprint_complete(&mut self) -> CtapResult<()> {
-        Ok(())
+        let state = self
+            .take_identify()
+            .ok_or(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR)?;
+        match state.identify {
+            Some(identify) => identify.abort().map_err(convert),
+            None => Ok(()),
+        }
     }
 
     fn fingerprint_kind(&self) -> FingerprintKind {
