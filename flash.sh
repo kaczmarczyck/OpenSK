@@ -78,6 +78,48 @@ fi
 
 cd "$WASEFIRE_DIR"
 
+has_feature() {
+  [[ ",$FEATURES," == *",$1,"* ]]
+}
+
+# Ensure led-1 is included for MDK
+if [ "$TARGET" = "nrf52840_mdk" ] && ! has_feature led-1; then
+  FEATURES="${FEATURES:+$FEATURES,}led-1"
+fi
+
+RELEASE_FLAGS=(--release)
+if has_feature debug; then
+  RELEASE_FLAGS=()
+fi
+
+RUNNER_FEATURES=(--features=usb-ctap)
+
+if has_feature ed25519; then
+  case $TARGET in
+    host)
+      ;;
+    opentitan)
+      RUNNER_FEATURES+=(--features=ed25519)
+      ;;
+    *)
+      echo "Error: Feature 'ed25519' is not supported on target '$TARGET'."
+      exit 1
+      ;;
+  esac
+fi
+
+if has_feature fingerprint; then
+  case $TARGET in
+    nrf52840dk)
+      RUNNER_FEATURES+=(--features=fpc2534)
+      ;;
+    *)
+      echo "Error: Feature 'fingerprint' is not supported on target '$TARGET'."
+      exit 1
+      ;;
+  esac
+fi
+
 echo "Flashing target: $TARGET"
 echo "With features: $FEATURES"
 
@@ -97,30 +139,25 @@ case $TARGET in
     fi
     ;;
   opentitan)
-    cargo xtask --release --native applet rust ../.. --opt-level=z --features="$FEATURES" \
-      runner opentitan --opt-level=z --features=usb-ctap \
+    cargo xtask "${RELEASE_FLAGS[@]}" --native applet rust ../.. --opt-level=z --features="$FEATURES" \
+      runner opentitan --opt-level=z "${RUNNER_FEATURES[@]}" \
       "${CMD[@]}"
     ;;
   nrf52840dk)
-    cargo xtask --release --native applet rust ../.. --opt-level=z --features="$FEATURES" \
-      runner nordic --opt-level=z --features=usb-ctap \
+    cargo xtask "${RELEASE_FLAGS[@]}" --native applet rust ../.. --opt-level=z --features="$FEATURES" \
+      runner nordic --opt-level=z "${RUNNER_FEATURES[@]}" \
         --features="$SOFTWARE_CRYPTO_FEATURES" \
       "${CMD[@]}"
     ;;
   nrf52840_dongle)
-    cargo xtask --release --native applet rust ../.. --opt-level=z --features="$FEATURES" \
-      runner nordic --board=dongle --opt-level=z --features=usb-ctap \
+    cargo xtask "${RELEASE_FLAGS[@]}" --native applet rust ../.. --opt-level=z --features="$FEATURES" \
+      runner nordic --board=dongle --opt-level=z "${RUNNER_FEATURES[@]}" \
         --features="$SOFTWARE_CRYPTO_FEATURES" \
       "${CMD[@]}"
     ;;
   nrf52840_mdk)
-    # Ensure led-1 is included for MDK
-    MDK_FEATURES="$FEATURES"
-    if [[ ! "$MDK_FEATURES" =~ "led-1" ]]; then
-      MDK_FEATURES="$MDK_FEATURES,led-1"
-    fi
-    cargo xtask --release --native applet rust ../.. --opt-level=z --features="$MDK_FEATURES" \
-      runner nordic --board=makerdiary --opt-level=z --features=usb-ctap \
+    cargo xtask "${RELEASE_FLAGS[@]}" --native applet rust ../.. --opt-level=z --features="$FEATURES" \
+      runner nordic --board=makerdiary --opt-level=z "${RUNNER_FEATURES[@]}" \
         --features="$SOFTWARE_CRYPTO_FEATURES" \
       "${CMD[@]}"
     ;;
