@@ -58,10 +58,12 @@ fn process_set_min_pin_length<E: Env>(
         new_min_pin_length,
         min_pin_length_rp_ids,
         force_change_pin,
+        pin_complexity_policy,
     } = params;
     let store_min_pin_length = storage::min_pin_length(env)?;
     let new_min_pin_length = new_min_pin_length.unwrap_or(store_min_pin_length);
-    if new_min_pin_length < store_min_pin_length || new_min_pin_length > MAX_PIN_LENGTH {
+    let max_pin_length = env.customization().max_pin_length().min(MAX_PIN_LENGTH);
+    if new_min_pin_length < store_min_pin_length || new_min_pin_length > max_pin_length {
         return Err(Ctap2StatusCode::CTAP2_ERR_PIN_POLICY_VIOLATION);
     }
     let mut force_change_pin = force_change_pin.unwrap_or(false);
@@ -77,10 +79,19 @@ fn process_set_min_pin_length<E: Env>(
     if let Some(min_pin_length_rp_ids) = min_pin_length_rp_ids {
         storage::set_min_pin_length_rp_ids(env, min_pin_length_rp_ids)?;
     }
+    if pin_complexity_policy == Some(true)
+        && env
+            .customization()
+            .default_pin_complexity_policy()
+            .is_some()
+    {
+        storage::enable_pin_complexity_policy(env)?;
+    }
     if force_change_pin {
         env.persist().force_pin_change()?;
     }
     if env.persist().has_force_pin_change()? {
+        super::client_pin::reset_persistent_pin_uv_auth_token(env)?;
         client_pin.reset_pin_uv_auth_token(env);
     }
     storage::set_min_pin_length(env, new_min_pin_length)?;
@@ -307,6 +318,7 @@ mod test {
             new_min_pin_length: Some(min_pin_length),
             min_pin_length_rp_ids,
             force_change_pin: None,
+            pin_complexity_policy: None,
         };
         AuthenticatorConfigParameters {
             sub_command: ConfigSubCommand::SetMinPinLength,
@@ -550,6 +562,7 @@ mod test {
             new_min_pin_length: Some(storage::min_pin_length(&mut env).unwrap()),
             min_pin_length_rp_ids: None,
             force_change_pin: Some(true),
+            pin_complexity_policy: None,
         };
         let config_params = AuthenticatorConfigParameters {
             sub_command: ConfigSubCommand::SetMinPinLength,
@@ -563,6 +576,187 @@ mod test {
         assert_eq!(config_response, Ok(ResponseData::AuthenticatorConfig));
         assert_eq!(env.persist().has_force_pin_change(), Ok(true));
         assert!(!client_pin.has_token(&mut env));
+    }
+
+    #[test]
+    fn test_process_set_min_pin_length_respects_custom_max_pin_length() {
+        let mut env = TestEnv::default();
+        env.customization_mut().set_max_pin_length(10);
+        let key_agreement_key = EcdhSk::<TestEnv>::random(env.rng());
+        let pin_uv_auth_token = [0x55; 32];
+        let mut client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            PinUvAuthProtocol::V1,
+        );
+
+        let config_params = create_min_pin_config_params(10, None);
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, config_params),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(storage::min_pin_length(&mut env), Ok(10));
+
+        let config_params = create_min_pin_config_params(11, None);
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, config_params),
+            Err(Ctap2StatusCode::CTAP2_ERR_PIN_POLICY_VIOLATION)
+        );
+        assert_eq!(storage::min_pin_length(&mut env), Ok(10));
+    }
+
+    #[test]
+    fn test_process_set_min_pin_length_pin_complexity_policy() {
+        let mut env = TestEnv::default();
+        let key_agreement_key = EcdhSk::<TestEnv>::random(env.rng());
+        let pin_uv_auth_token = [0x55; 32];
+        let mut client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            PinUvAuthProtocol::V1,
+        );
+
+        // Ignored when pinComplexityPolicy is not supported by customization.
+        let params = AuthenticatorConfigParameters {
+            sub_command: ConfigSubCommand::SetMinPinLength,
+            sub_command_params: Some(ConfigSubCommandParams::SetMinPinLength(
+                SetMinPinLengthParams {
+                    new_min_pin_length: None,
+                    min_pin_length_rp_ids: None,
+                    force_change_pin: None,
+                    pin_complexity_policy: Some(true),
+                },
+            )),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, params),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(None));
+
+        // Enable configurable pinComplexityPolicy starting at false.
+        env.customization_mut()
+            .setup_pin_complexity_policy(Some(false), Some(b"https://example.com/pin".to_vec()));
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(Some(false)));
+
+        // Passing false leaves it false.
+        let make_params = |policy: Option<bool>| AuthenticatorConfigParameters {
+            sub_command: ConfigSubCommand::SetMinPinLength,
+            sub_command_params: Some(ConfigSubCommandParams::SetMinPinLength(
+                SetMinPinLengthParams {
+                    new_min_pin_length: None,
+                    min_pin_length_rp_ids: None,
+                    force_change_pin: None,
+                    pin_complexity_policy: policy,
+                },
+            )),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, make_params(Some(false))),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(Some(false)));
+
+        // Failing minPinLengthRPIDs write does not partially enable pinComplexityPolicy.
+        let oversized_rp_ids = Some(vec!["r".repeat(500), "s".repeat(500), "t".repeat(500)]);
+        let params_fail = AuthenticatorConfigParameters {
+            sub_command: ConfigSubCommand::SetMinPinLength,
+            sub_command_params: Some(ConfigSubCommandParams::SetMinPinLength(
+                SetMinPinLengthParams {
+                    new_min_pin_length: None,
+                    min_pin_length_rp_ids: oversized_rp_ids,
+                    force_change_pin: None,
+                    pin_complexity_policy: Some(true),
+                },
+            )),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        assert!(process_config(&mut env, &mut client_pin, params_fail).is_err());
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(Some(false)));
+
+        // Passing true enables it, and subsequent false keeps it true until reset.
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, make_params(Some(true))),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(Some(true)));
+
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, make_params(Some(false))),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(storage::pin_complexity_policy(&mut env), Ok(Some(true)));
+    }
+
+    #[test]
+    fn test_process_set_min_pin_length_force_pin_change_resets_persistent_token() {
+        let mut env = TestEnv::default();
+        storage::init(&mut env).unwrap();
+        let key_agreement_key = EcdhSk::<TestEnv>::random(env.rng());
+        let pin_uv_auth_token = [0x55; 32];
+        let mut client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            PinUvAuthProtocol::V2,
+        );
+
+        env.persist().set_pin(&[0x88; 16], 4).unwrap();
+        let persistent_token =
+            crate::ctap::client_pin::get_persistent_token_and_set_pcmr(&mut env).unwrap();
+        let data = b"cred management data";
+        let pcmr_auth =
+            authenticate_pin_uv_auth_token(&persistent_token, data, PinUvAuthProtocol::V2);
+        assert_eq!(
+            client_pin.verify_pin_uv_auth_token_with_pcmr(
+                &mut env,
+                data,
+                &pcmr_auth,
+                PinUvAuthProtocol::V2,
+            ),
+            Ok(true)
+        );
+
+        let sub_params = ConfigSubCommandParams::SetMinPinLength(SetMinPinLengthParams {
+            new_min_pin_length: None,
+            min_pin_length_rp_ids: None,
+            force_change_pin: Some(true),
+            pin_complexity_policy: None,
+        });
+        let mut config_data = vec![0xFF; 32];
+        config_data.extend(&[0x0D, ConfigSubCommand::SetMinPinLength as u8]);
+        super::super::cbor_write(sub_params.clone().into(), &mut config_data).unwrap();
+        let pin_uv_auth_param =
+            authenticate_pin_uv_auth_token(&pin_uv_auth_token, &config_data, PinUvAuthProtocol::V2);
+
+        let config_params = AuthenticatorConfigParameters {
+            sub_command: ConfigSubCommand::SetMinPinLength,
+            sub_command_params: Some(sub_params),
+            pin_uv_auth_param: Some(pin_uv_auth_param),
+            pin_uv_auth_protocol: Some(PinUvAuthProtocol::V2),
+        };
+        assert_eq!(
+            process_config(&mut env, &mut client_pin, config_params),
+            Ok(ResponseData::AuthenticatorConfig)
+        );
+        assert_eq!(env.persist().has_force_pin_change(), Ok(true));
+        assert!(!client_pin.has_token(&mut env));
+        assert_eq!(
+            client_pin.verify_pin_uv_auth_token_with_pcmr(
+                &mut env,
+                data,
+                &pcmr_auth,
+                PinUvAuthProtocol::V2,
+            ),
+            Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID)
+        );
     }
 
     #[test]

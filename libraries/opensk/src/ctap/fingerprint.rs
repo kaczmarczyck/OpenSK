@@ -178,11 +178,13 @@ fn check_fingerprint_loop<E: Env>(
     for _ in 0..FINGERPRINT_TIMEOUT_LOOPS {
         match env.fingerprint().check_fingerprint(FINGERPRINT_TIMEOUT_MS) {
             Ok(()) => {
+                storage::incr_uv_count_since_last_pin_entry(env)?;
                 return storage::reset_uv_retries(env);
             }
             Err(error) => {
                 match error {
                     FingerprintCheckError::NoMatch | FingerprintCheckError::Other => {
+                        storage::incr_uv_count_since_last_pin_entry(env)?;
                         storage::decr_uv_retries(env)?;
                         if storage::uv_retries(env)? == 0 {
                             return Err(Ctap2StatusCode::CTAP2_ERR_UV_BLOCKED);
@@ -876,5 +878,28 @@ mod test {
             perform_built_in_uv(&mut env, DUMMY_CHANNEL, false),
             Err(Ctap2StatusCode::CTAP2_ERR_UV_BLOCKED)
         );
+    }
+
+    #[test]
+    fn test_uv_count_since_last_pin_entry() {
+        let mut env = TestEnv::default();
+        assert_eq!(storage::uv_count_since_last_pin_entry(&mut env), Ok(0));
+
+        // Unenrolled template without sensor match fails with UV_INVALID and increments count.
+        env.persist().store_template_id(vec![0x00]).unwrap();
+        assert_eq!(
+            perform_built_in_uv(&mut env, DUMMY_CHANNEL, false),
+            Err(Ctap2StatusCode::CTAP2_ERR_UV_INVALID)
+        );
+        assert_eq!(storage::uv_count_since_last_pin_entry(&mut env), Ok(1));
+
+        // Successful fingerprint match also increments count.
+        env.create_fingerprint().unwrap();
+        assert_eq!(perform_built_in_uv(&mut env, DUMMY_CHANNEL, false), Ok(()));
+        assert_eq!(storage::uv_count_since_last_pin_entry(&mut env), Ok(2));
+
+        // Setting a PIN resets the counter to 0.
+        env.persist().set_pin(&[0x88; 16], 4).unwrap();
+        assert_eq!(storage::uv_count_since_last_pin_entry(&mut env), Ok(0));
     }
 }

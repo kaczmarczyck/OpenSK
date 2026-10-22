@@ -173,6 +173,7 @@ pub struct AuthenticatorMakeCredentialParameters {
     pub pin_uv_auth_param: Option<Vec<u8>>,
     pub pin_uv_auth_protocol: Option<PinUvAuthProtocol>,
     pub enterprise_attestation: Option<u64>,
+    pub attestation_formats_preference: Option<Vec<String>>,
 }
 
 impl TryFrom<cbor::Value> for AuthenticatorMakeCredentialParameters {
@@ -191,6 +192,7 @@ impl TryFrom<cbor::Value> for AuthenticatorMakeCredentialParameters {
                 0x08 => pin_uv_auth_param,
                 0x09 => pin_uv_auth_protocol,
                 0x0A => enterprise_attestation,
+                0x0B => attestation_formats_preference,
             } = extract_map(cbor_value)?;
         }
 
@@ -245,6 +247,15 @@ impl TryFrom<cbor::Value> for AuthenticatorMakeCredentialParameters {
             .transpose()?;
         // We don't convert into EnterpriseAttestationMode to maintain the correct order of errors.
         let enterprise_attestation = enterprise_attestation.map(extract_unsigned).transpose()?;
+        let attestation_formats_preference = match attestation_formats_preference {
+            Some(entry) => Some(
+                extract_array(entry)?
+                    .into_iter()
+                    .map(extract_text_string)
+                    .collect::<CtapResult<Vec<String>>>()?,
+            ),
+            None => None,
+        };
 
         Ok(AuthenticatorMakeCredentialParameters {
             client_data_hash,
@@ -257,6 +268,7 @@ impl TryFrom<cbor::Value> for AuthenticatorMakeCredentialParameters {
             pin_uv_auth_param,
             pin_uv_auth_protocol,
             enterprise_attestation,
+            attestation_formats_preference,
         })
     }
 }
@@ -700,6 +712,7 @@ mod test {
             0x08 => vec![0x12, 0x34],
             0x09 => 1,
             0x0A => 2,
+            0x0B => cbor_array!["none", "packed"],
         };
         let returned_make_credential_parameters =
             AuthenticatorMakeCredentialParameters::try_from(cbor_value).unwrap();
@@ -734,6 +747,7 @@ mod test {
             pin_uv_auth_param: Some(vec![0x12, 0x34]),
             pin_uv_auth_protocol: Some(PinUvAuthProtocol::V1),
             enterprise_attestation: Some(2),
+            attestation_formats_preference: Some(vec!["none".to_string(), "packed".to_string()]),
         };
 
         assert_eq!(
@@ -1019,6 +1033,7 @@ mod test {
                 0x01 => 6,
                 0x02 => cbor_array![String::from("example.com")],
                 0x03 => true,
+                0x04 => true,
             },
             0x03 => 1,
             0x04 => vec! [0x9A; 16],
@@ -1030,6 +1045,7 @@ mod test {
             new_min_pin_length: Some(6),
             min_pin_length_rp_ids: Some(vec![String::from("example.com")]),
             force_change_pin: Some(true),
+            pin_complexity_policy: Some(true),
         });
         let expected_config_parameters = AuthenticatorConfigParameters {
             sub_command: ConfigSubCommand::SetMinPinLength,

@@ -46,6 +46,8 @@ use self::command::{
 #[cfg(feature = "config_command")]
 use self::config_command::process_config;
 use self::credential_management::process_credential_management;
+#[cfg(feature = "config_command")]
+use self::data_formats::ConfigSubCommand;
 use self::data_formats::{
     AuthenticatorTransport, CredentialProtectionPolicy, EnterpriseAttestationMode,
     GetAssertionExtensions, PackedAttestationStatement, PinUvAuthProtocol,
@@ -815,6 +817,7 @@ impl<E: Env> CtapState<E> {
             pin_uv_auth_param,
             pin_uv_auth_protocol,
             enterprise_attestation,
+            attestation_formats_preference,
         } = make_credential_params;
 
         self.pin_uv_auth_precheck(env, &pin_uv_auth_param, pin_uv_auth_protocol, channel)?;
@@ -944,8 +947,17 @@ impl<E: Env> CtapState<E> {
         {
             cred_protect_policy = default_cred_protect;
         }
-        let min_pin_length =
-            extensions.min_pin_length && storage::min_pin_length_rp_ids(env)?.contains(&rp_id);
+        let authorized_min_pin_rp = (extensions.min_pin_length || extensions.pin_complexity_policy)
+            && storage::min_pin_length_rp_ids(env)?.contains(&rp_id);
+        let min_pin_length = extensions.min_pin_length && authorized_min_pin_rp;
+        let pin_complexity_policy_output = if cfg!(feature = "config_command")
+            && extensions.pin_complexity_policy
+            && authorized_min_pin_rp
+        {
+            storage::pin_complexity_policy(env)?
+        } else {
+            None
+        };
         // None for no input, false for invalid input, true for valid input.
         let has_cred_blob_output = extensions.cred_blob.is_some();
         let cred_blob = extensions
@@ -960,6 +972,7 @@ impl<E: Env> CtapState<E> {
             || extensions.hmac_secret_mc.is_some()
             || extensions.cred_protect.is_some()
             || min_pin_length
+            || pin_complexity_policy_output.is_some()
             || has_cred_blob_output;
         if has_extension_output {
             flags |= ED_FLAG
@@ -1048,8 +1061,21 @@ impl<E: Env> CtapState<E> {
                 "credProtect" => cred_protect_output,
                 "hmac-secret" => hmac_secret_output,
                 "minPinLength" => min_pin_length_output,
+                "pinComplexityPolicy" => pin_complexity_policy_output,
             };
             cbor_write(extensions_output, &mut auth_data)?;
+        }
+
+        if matches!(attestation_formats_preference.as_deref(), Some([fmt]) if fmt == "none") {
+            return Ok(ResponseData::AuthenticatorMakeCredential(
+                AuthenticatorMakeCredentialResponse {
+                    fmt: String::from("none"),
+                    auth_data,
+                    att_stmt: None,
+                    ep_att: None,
+                    large_blob_key,
+                },
+            ));
         }
 
         let mut signature_data = auth_data.clone();
@@ -1091,7 +1117,7 @@ impl<E: Env> CtapState<E> {
             AuthenticatorMakeCredentialResponse {
                 fmt: String::from("packed"),
                 auth_data,
-                att_stmt: attestation_statement,
+                att_stmt: Some(attestation_statement),
                 ep_att,
                 large_blob_key,
             },
@@ -1315,9 +1341,6 @@ impl<E: Env> CtapState<E> {
         }
 
         let has_uv = has_pin_uv_auth_param || options.uv;
-        if extensions.hmac_secret.is_some() && !has_uv {
-            return Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID);
-        }
         let rp_id_hash = Sha::<E>::digest(rp_id.as_bytes());
         let (credential, next_credential_keys) = if let Some(allow_list) = allow_list {
             (
@@ -1433,7 +1456,6 @@ impl<E: Env> CtapState<E> {
             (String::from("makeCredUvNotRqd"), !has_always_uv),
             (String::from("alwaysUv"), has_always_uv),
             (String::from("perCredMgmtRO"), true),
-            (String::from("persistentPinUvAuthToken"), true),
         ];
         #[cfg(feature = "fingerprint")]
         {
@@ -1449,18 +1471,51 @@ impl<E: Env> CtapState<E> {
             pin_protocols.push(PinUvAuthProtocol::V1 as u64);
         }
 
+        #[cfg_attr(not(feature = "config_command"), allow(unused_mut))]
+        let mut extensions = vec![
+            String::from("hmac-secret"),
+            String::from("credProtect"),
+            String::from("minPinLength"),
+            String::from("credBlob"),
+            String::from("largeBlobKey"),
+            String::from("hmac-secret-mc"),
+            String::from("thirdPartyPayment"),
+        ];
+        #[cfg(feature = "config_command")]
+        if env
+            .customization()
+            .default_pin_complexity_policy()
+            .is_some()
+        {
+            extensions.push(String::from("pinComplexityPolicy"));
+        }
+
+        let pin_complexity_policy = storage::pin_complexity_policy(env)?;
+        let pin_complexity_policy_url = if pin_complexity_policy.is_some() {
+            env.customization()
+                .pin_complexity_policy_url()
+                .map(|url| url.to_vec())
+        } else {
+            None
+        };
+
+        #[cfg(feature = "config_command")]
+        let authenticator_config_commands = {
+            let mut commands = Vec::new();
+            if env.customization().enterprise_attestation_mode().is_some() {
+                commands.push(ConfigSubCommand::EnableEnterpriseAttestation);
+            }
+            commands.push(ConfigSubCommand::ToggleAlwaysUv);
+            commands.push(ConfigSubCommand::SetMinPinLength);
+            Some(commands)
+        };
+        #[cfg(not(feature = "config_command"))]
+        let authenticator_config_commands = None;
+
         Ok(ResponseData::AuthenticatorGetInfo(
             AuthenticatorGetInfoResponse {
                 versions,
-                extensions: Some(vec![
-                    String::from("hmac-secret"),
-                    String::from("credProtect"),
-                    String::from("minPinLength"),
-                    String::from("credBlob"),
-                    String::from("largeBlobKey"),
-                    String::from("hmac-secret-mc"),
-                    String::from("thirdPartyPayment"),
-                ]),
+                extensions: Some(extensions),
                 aaguid: env.persist().aaguid()?,
                 options: Some(options),
                 max_msg_size: Some(env.customization().max_msg_size() as u64),
@@ -1498,6 +1553,18 @@ impl<E: Env> CtapState<E> {
                 remaining_discoverable_credentials: Some(
                     storage::remaining_credentials(env)? as u64
                 ),
+                attestation_formats: Some(vec![String::from("packed")]),
+                #[cfg(feature = "fingerprint")]
+                uv_count_since_last_pin_entry: Some(
+                    storage::uv_count_since_last_pin_entry(env)? as u64
+                ),
+                #[cfg(not(feature = "fingerprint"))]
+                uv_count_since_last_pin_entry: None,
+                transports_for_reset: Some(vec![AuthenticatorTransport::Usb]),
+                pin_complexity_policy,
+                pin_complexity_policy_url,
+                max_pin_length: Some(env.customization().max_pin_length()),
+                authenticator_config_commands,
             },
         ))
     }
@@ -1917,7 +1984,10 @@ mod test {
                     expected_extension_cbor
                 );
                 assert!(ep_att.is_none());
-                assert_eq!(att_stmt.alg, SignatureAlgorithm::Es256 as i64);
+                assert_eq!(
+                    att_stmt.as_ref().unwrap().alg,
+                    SignatureAlgorithm::Es256 as i64
+                );
                 assert_eq!(large_blob_key, &None);
             }
             _ => panic!("Invalid response type"),
@@ -1935,6 +2005,14 @@ mod test {
         let uv_attempts = Some(env.customization().preferred_platform_uv_attempts() as u64);
         #[cfg(not(feature = "fingerprint"))]
         let uv_attempts: Option<u64> = None;
+
+        #[cfg(feature = "config_command")]
+        let config_commands = cbor_array![
+            ConfigSubCommand::ToggleAlwaysUv as u64,
+            ConfigSubCommand::SetMinPinLength as u64,
+        ];
+        #[cfg(not(feature = "config_command"))]
+        let config_commands: Option<cbor::Value> = None;
 
         // Fails when removing `to_vec` for `SUPPORTED_CRED_PARAMS` as linted.
         #[allow(clippy::unnecessary_to_owned)]
@@ -1972,7 +2050,6 @@ mod test {
                 "setMinPINLength" => cfg!(feature = "config_command").then_some(true),
                 "makeCredUvNotRqd" => true,
                 "perCredMgmtRO" => true,
-                "persistentPinUvAuthToken" => true,
             },
             0x05 => env.customization().max_msg_size() as u64,
             0x06 => cbor_array![2, 1],
@@ -1989,6 +2066,11 @@ mod test {
             0x11 => uv_attempts,
             0x12 => cfg!(feature = "fingerprint").then_some(0x02),
             0x14 => storage::remaining_credentials(&mut env).unwrap() as u64,
+            0x16 => cbor_array!["packed"],
+            0x17 => cfg!(feature = "fingerprint").then_some(0),
+            0x1A => cbor_array!["usb"],
+            0x1D => env.customization().max_pin_length() as u64,
+            0x1F => config_commands,
         };
 
         let mut response_cbor = vec![0x00];
@@ -2042,6 +2124,7 @@ mod test {
             pin_uv_auth_param: None,
             pin_uv_auth_protocol: None,
             enterprise_attestation: None,
+            attestation_formats_preference: None,
         }
     }
 
@@ -2413,7 +2496,7 @@ mod test {
             key_agreement: CoseKey::from_ecdh_public_key::<TestEnv>(platform_public_key),
             salt_enc,
             salt_auth,
-            pin_uv_auth_protocol: PinUvAuthProtocol::V1,
+            pin_uv_auth_protocol: Some(PinUvAuthProtocol::V1),
         };
 
         // Case 1: hmac-secret is false, hmac-secret-mc is Some
@@ -2469,7 +2552,7 @@ mod test {
             key_agreement: platform_public_key,
             salt_enc,
             salt_auth,
-            pin_uv_auth_protocol: PinUvAuthProtocol::V1,
+            pin_uv_auth_protocol: Some(PinUvAuthProtocol::V1),
         };
 
         let extensions = MakeCredentialExtensions {
@@ -2548,7 +2631,7 @@ mod test {
             key_agreement: platform_public_key,
             salt_enc,
             salt_auth,
-            pin_uv_auth_protocol: PinUvAuthProtocol::V1,
+            pin_uv_auth_protocol: Some(PinUvAuthProtocol::V1),
         };
 
         let extensions = MakeCredentialExtensions {
@@ -3525,7 +3608,7 @@ mod test {
             key_agreement: CoseKey::from_ecdh_public_key::<TestEnv>(platform_public_key),
             salt_enc,
             salt_auth,
-            pin_uv_auth_protocol,
+            pin_uv_auth_protocol: Some(pin_uv_auth_protocol),
         };
         let get_extensions = GetAssertionExtensions {
             hmac_secret: Some(hmac_secret_input),
@@ -5043,10 +5126,10 @@ mod test {
 
     fn info_get_option_value(map: &[(cbor::Value, cbor::Value)], key_str: &str) -> Option<bool> {
         for (k, v) in map {
-            if let Some(s) = k.clone().extract_text_string() {
-                if s == key_str {
-                    return v.clone().extract_bool();
-                }
+            if let Some(s) = k.clone().extract_text_string()
+                && s == key_str
+            {
+                return v.clone().extract_bool();
             }
         }
         None
@@ -5062,10 +5145,10 @@ mod test {
         let map = val.extract_map().unwrap();
 
         for (k, v) in map {
-            if let Some(i) = k.extract_unsigned() {
-                if i == 0x04 {
-                    return v.extract_map().unwrap();
-                }
+            if let Some(i) = k.extract_unsigned()
+                && i == 0x04
+            {
+                return v.extract_map().unwrap();
             }
         }
         panic!("Options map not found in GetInfo response");
@@ -5079,14 +5162,14 @@ mod test {
         let map = val.extract_map().unwrap();
 
         for (k, v) in map {
-            if let Some(i) = k.extract_unsigned() {
-                if i == 0x01 {
-                    let arr = v.extract_array().unwrap();
-                    return arr
-                        .into_iter()
-                        .map(|item| item.extract_text_string().unwrap())
-                        .collect();
-                }
+            if let Some(i) = k.extract_unsigned()
+                && i == 0x01
+            {
+                let arr = v.extract_array().unwrap();
+                return arr
+                    .into_iter()
+                    .map(|item| item.extract_text_string().unwrap())
+                    .collect();
             }
         }
         panic!("Versions not found in GetInfo response");
@@ -5902,7 +5985,9 @@ mod test {
             let hmac_secret_input =
                 build_hmac_secret_mc_input(&mut env, &mut state, protocol, &salt);
 
-            let response_err = run_get_assertion_hmac(
+            // Per CTAP 2.3 §12.7, GetAssertion with hmac-secret succeeds without UV
+            // (using CredRandomWithoutUV), and invalid pinUvAuthParam still fails with 0x33.
+            let response_no_uv = run_get_assertion_hmac(
                 &mut env,
                 &mut state,
                 "rp.com".to_string(),
@@ -5911,12 +5996,18 @@ mod test {
                 None,
                 None,
             )
-            .unwrap_err();
-            assert_eq!(
-                response_err, 0x33,
-                "Protocol {:?} failed assertion missing param",
-                protocol
-            );
+            .unwrap();
+            let val_no_uv = cbor::reader::read(&response_no_uv).unwrap();
+            let auth_data_no_uv = val_no_uv
+                .extract_map()
+                .unwrap()
+                .into_iter()
+                .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+                .unwrap()
+                .extract_byte_string()
+                .unwrap();
+            assert_eq!(auth_data_no_uv[32] & UV_FLAG, 0);
+            assert_ne!(auth_data_no_uv[32] & ED_FLAG, 0);
 
             let invalid_pin_uv_auth_param = match protocol {
                 PinUvAuthProtocol::V1 => vec![0x99; 16],
@@ -6397,6 +6488,7 @@ mod test {
 
         let token_v2 = retrieve_persistent_token(&mut env, &mut state, PinUvAuthProtocol::V2, pin);
         assert_eq!(token_v2.len(), 32);
+        assert_eq!(token_v1, token_v2);
 
         let token_v2_retry =
             retrieve_persistent_token(&mut env, &mut state, PinUvAuthProtocol::V2, pin);
@@ -6433,11 +6525,36 @@ mod test {
         let response = state_for_reset.process_command(&mut env, &[0x07], DUMMY_CHANNEL);
         assert_eq!(response[0], 0x00, "Reset failed");
 
-        assert!(
-            env.persist()
-                .find(keys::PERSISTENT_PIN_UV_AUTH_TOKEN)
-                .unwrap()
-                .is_none()
+        let stored = env
+            .persist()
+            .find(keys::PERSISTENT_PIN_UV_AUTH_TOKEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.len(), 33);
+        assert_ne!(&stored[..32], new_token.as_slice());
+        assert_eq!(stored[32], 0);
+
+        assert_eq!(
+            run_credential_management_cmd(
+                &mut env,
+                &mut state_for_reset,
+                CredentialManagementSubCommand::GetCredsMetadata,
+                None,
+                Some(&new_token),
+                Some(PinUvAuthProtocol::V2),
+            ),
+            Err(0x33),
+        );
+        assert_eq!(
+            run_credential_management_cmd(
+                &mut env,
+                &mut state_for_reset,
+                CredentialManagementSubCommand::GetCredsMetadata,
+                None,
+                Some(&stored[..32]),
+                Some(PinUvAuthProtocol::V2),
+            ),
+            Err(0x33),
         );
     }
 
@@ -7172,5 +7289,516 @@ mod test {
             run_credential_management_enumerate_credentials(&mut env, &mut state, pin, "rp.com")
                 .unwrap();
         check_cm_response_tpp(&cm_res, true);
+    }
+
+    #[test]
+    #[cfg(feature = "config_command")]
+    fn test_make_credential_attestation_formats_preference() {
+        let mut env = TestEnv::default();
+        env.customization_mut().setup_enterprise_attestation(
+            Some(EnterpriseAttestationMode::VendorFacilitated),
+            Some(vec!["rp.com".to_string()]),
+        );
+        let mut state = CtapState::new(&mut env);
+        test_helpers::enable_enterprise_attestation(&mut state, &mut env).unwrap();
+
+        let run_with_pref = |env: &mut TestEnv,
+                             state: &mut CtapState<TestEnv>,
+                             prefs: Vec<&str>|
+         -> Vec<(cbor::Value, cbor::Value)> {
+            let pref_vals: Vec<cbor::Value> = prefs.into_iter().map(cbor::Value::from).collect();
+            let make_cred = cbor_map! {
+                0x01 => cbor_bytes!(vec![0xAA; 32]),
+                0x02 => cbor_map! { "id" => "rp.com" },
+                0x03 => cbor_map! {
+                    "id" => cbor_bytes!(vec![0x01]),
+                    "name" => "user",
+                },
+                0x04 => cbor_array![cbor_map! { "alg" => -7, "type" => "public-key" }],
+                0x0A => 1,
+                0x0B => sk_cbor::cbor_array_vec!(pref_vals),
+            };
+            let mut cmd_bytes = vec![0x01];
+            super::cbor_write(make_cred, &mut cmd_bytes).unwrap();
+            let resp = state.process_command(env, &cmd_bytes, DUMMY_CHANNEL);
+            assert_eq!(resp[0], 0x00);
+            cbor::reader::read(&resp[1..])
+                .unwrap()
+                .extract_map()
+                .unwrap()
+        };
+
+        // ["none"] omits attStmt (0x03) and epAtt (0x04) and returns fmt: "none".
+        let none_map = run_with_pref(&mut env, &mut state, vec!["none"]);
+        let fmt = none_map
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x01)).then_some(v.clone()))
+            .unwrap()
+            .extract_text_string()
+            .unwrap();
+        assert_eq!(fmt, "none");
+        assert!(
+            none_map
+                .iter()
+                .any(|(k, _)| k.clone().extract_unsigned() == Some(0x02))
+        );
+        assert!(
+            !none_map
+                .iter()
+                .any(|(k, _)| k.clone().extract_unsigned() == Some(0x03))
+        );
+        assert!(
+            !none_map
+                .iter()
+                .any(|(k, _)| k.clone().extract_unsigned() == Some(0x04))
+        );
+
+        // Any other preference falls back to "packed" with attStmt (0x03) and epAtt (0x04).
+        for prefs in [vec!["packed"], vec!["none", "packed"], vec!["tpm"], vec![]] {
+            let map = run_with_pref(&mut env, &mut state, prefs);
+            let fmt = map
+                .iter()
+                .find_map(|(k, v)| {
+                    (k.clone().extract_unsigned() == Some(0x01)).then_some(v.clone())
+                })
+                .unwrap()
+                .extract_text_string()
+                .unwrap();
+            assert_eq!(fmt, "packed");
+            assert!(
+                map.iter()
+                    .any(|(k, _)| k.clone().extract_unsigned() == Some(0x03))
+            );
+            assert!(
+                map.iter()
+                    .any(|(k, _)| k.clone().extract_unsigned() == Some(0x04))
+            );
+        }
+    }
+
+    #[test]
+    fn test_pin_complexity_policy_end_to_end() {
+        let mut env = TestEnv::default();
+        env.customization_mut()
+            .setup_pin_complexity_policy(Some(false), Some(b"https://example.com/pin".to_vec()));
+        let mut state = CtapState::new(&mut env);
+
+        let read_info_map = |env: &mut TestEnv, state: &mut CtapState<TestEnv>| {
+            let resp = state.process_command(env, &[0x04], DUMMY_CHANNEL);
+            assert_eq!(resp[0], 0x00);
+            cbor::reader::read(&resp[1..])
+                .unwrap()
+                .extract_map()
+                .unwrap()
+        };
+
+        let info = read_info_map(&mut env, &mut state);
+        let exts: Vec<String> = info
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x02)).then_some(v.clone()))
+            .unwrap()
+            .extract_array()
+            .unwrap()
+            .into_iter()
+            .map(|v| v.extract_text_string().unwrap())
+            .collect();
+        assert!(exts.iter().any(|e| e == "pinComplexityPolicy"));
+        let policy = info
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x1B)).then_some(v.clone()))
+            .unwrap()
+            .extract_bool()
+            .unwrap();
+        assert!(!policy);
+        let policy_url = info
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x1C)).then_some(v.clone()))
+            .unwrap()
+            .extract_byte_string()
+            .unwrap();
+        assert_eq!(policy_url, b"https://example.com/pin");
+
+        // While policy is false, "1111" is accepted.
+        ctap_set_pin(&mut env, &mut state, PinUvAuthProtocol::V2, b"1111");
+
+        // Unauthorized RP receives no pinComplexityPolicy extension output.
+        let make_cred_unauth = cbor_map! {
+            0x01 => cbor_bytes!(vec![0xAA; 32]),
+            0x02 => cbor_map! { "id" => "unauthorized.com" },
+            0x03 => cbor_map! { "id" => cbor_bytes!(vec![0x01]), "name" => "user" },
+            0x04 => cbor_array![cbor_map! { "alg" => -7, "type" => "public-key" }],
+            0x06 => cbor_map! { "pinComplexityPolicy" => true },
+        };
+        let mut cmd_bytes = vec![0x01];
+        super::cbor_write(make_cred_unauth, &mut cmd_bytes).unwrap();
+        let mc_unauth_resp = state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL);
+        assert_eq!(mc_unauth_resp[0], 0x00);
+        let auth_data_unauth = cbor::reader::read(&mc_unauth_resp[1..])
+            .unwrap()
+            .extract_map()
+            .unwrap()
+            .into_iter()
+            .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+            .unwrap()
+            .extract_byte_string()
+            .unwrap();
+        assert_eq!(auth_data_unauth[32] & ED_FLAG, 0);
+
+        // Enable pinComplexityPolicy and authorize "authorized.com" via AuthenticatorConfig.
+        let cose_key = hmac_get_key_agreement(&mut env, &mut state, PinUvAuthProtocol::V2);
+        let authenticator_public = cose_key.try_into_ecdh_public_key::<TestEnv>().unwrap();
+        let platform_private = EcdhSk::<TestEnv>::random(env.rng());
+        let platform_cose_key =
+            CoseKey::from_ecdh_public_key::<TestEnv>(platform_private.public_key());
+        let handshake = get_shared_secret(&platform_private, &authenticator_public);
+        let pin_hash = SoftwareSha256::digest(b"1111");
+        let pin_hash_enc =
+            encrypt_pin_hash(PinUvAuthProtocol::V2, &handshake, &pin_hash, env.rng());
+        let get_acfg_cmd = cbor_map! {
+            0x01 => PinUvAuthProtocol::V2 as u64,
+            0x02 => ClientPinSubCommand::GetPinUvAuthTokenUsingPinWithPermissions as u64,
+            0x03 => platform_cose_key,
+            0x06 => cbor_bytes!(pin_hash_enc),
+            0x09 => PinPermission::AuthenticatorConfiguration as u64,
+        };
+        let mut cmd_bytes = vec![0x06];
+        super::cbor_write(get_acfg_cmd, &mut cmd_bytes).unwrap();
+        let acfg_resp = state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL);
+        assert_eq!(acfg_resp[0], 0x00);
+        let token_enc = cbor::reader::read(&acfg_resp[1..])
+            .unwrap()
+            .extract_map()
+            .unwrap()
+            .into_iter()
+            .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+            .unwrap()
+            .extract_byte_string()
+            .unwrap();
+        let mut aes_key_bytes = [0u8; 32];
+        SoftwareHkdf256::hkdf_empty_salt_256(&handshake, b"CTAP2 AES key", &mut aes_key_bytes);
+        let acfg_token = super::crypto_wrapper::aes256_cbc_decrypt::<TestEnv>(
+            &SoftwareAes256::new(&aes_key_bytes),
+            &token_enc,
+            true,
+        )
+        .unwrap();
+
+        let sub_params = cbor_map! {
+            0x02 => cbor_array!["authorized.com"],
+            0x04 => true,
+        };
+        let mut config_data = vec![0xFF; 32];
+        config_data.extend(&[0x0D, 0x03]);
+        super::cbor_write(sub_params.clone(), &mut config_data).unwrap();
+        let config_auth = authenticate_signature(&acfg_token, &config_data, PinUvAuthProtocol::V2);
+        let config_cmd = cbor_map! {
+            0x01 => 0x03,
+            0x02 => sub_params,
+            0x03 => PinUvAuthProtocol::V2 as u64,
+            0x04 => cbor_bytes!(config_auth),
+        };
+        let mut cmd_bytes = vec![0x0D];
+        super::cbor_write(config_cmd, &mut cmd_bytes).unwrap();
+        let config_resp = state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL);
+        assert_eq!(config_resp[0], 0x00);
+
+        // GetInfo now reports pinComplexityPolicy == true.
+        let info = read_info_map(&mut env, &mut state);
+        let policy = info
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x1B)).then_some(v.clone()))
+            .unwrap()
+            .extract_bool()
+            .unwrap();
+        assert!(policy);
+
+        // Trivial PIN "2222" is now rejected on ChangePin, while "1234" succeeds.
+        let cose_key = hmac_get_key_agreement(&mut env, &mut state, PinUvAuthProtocol::V2);
+        let authenticator_public = cose_key.try_into_ecdh_public_key::<TestEnv>().unwrap();
+        let platform_private = EcdhSk::<TestEnv>::random(env.rng());
+        let platform_cose_key =
+            CoseKey::from_ecdh_public_key::<TestEnv>(platform_private.public_key());
+        let handshake = get_shared_secret(&platform_private, &authenticator_public);
+        let old_pin_hash = SoftwareSha256::digest(b"1111");
+        let pin_hash_enc =
+            encrypt_pin_hash(PinUvAuthProtocol::V2, &handshake, &old_pin_hash, env.rng());
+        let new_pin_enc = encrypt_padded_pin(PinUvAuthProtocol::V2, &handshake, b"2222", env.rng());
+        let mut auth_data = new_pin_enc.clone();
+        auth_data.extend(&pin_hash_enc);
+        let verification_key = get_verification_key(&handshake, PinUvAuthProtocol::V2);
+        let change_auth =
+            authenticate_signature(&verification_key, &auth_data, PinUvAuthProtocol::V2);
+        let bad_change_cmd = cbor_map! {
+            0x01 => PinUvAuthProtocol::V2 as u64,
+            0x02 => ClientPinSubCommand::ChangePin as u64,
+            0x03 => platform_cose_key,
+            0x04 => cbor_bytes!(change_auth),
+            0x05 => cbor_bytes!(new_pin_enc),
+            0x06 => cbor_bytes!(pin_hash_enc),
+        };
+        let mut cmd_bytes = vec![0x06];
+        super::cbor_write(bad_change_cmd, &mut cmd_bytes).unwrap();
+        let bad_change_resp = state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL);
+        assert_eq!(
+            bad_change_resp[0],
+            Ctap2StatusCode::CTAP2_ERR_PIN_POLICY_VIOLATION as u8
+        );
+
+        ctap_change_pin(
+            &mut env,
+            &mut state,
+            PinUvAuthProtocol::V2,
+            b"1111",
+            b"1234",
+        );
+
+        // Authorized RP receives {"pinComplexityPolicy": true} in authData extensions.
+        let make_cred_auth = cbor_map! {
+            0x01 => cbor_bytes!(vec![0xAA; 32]),
+            0x02 => cbor_map! { "id" => "authorized.com" },
+            0x03 => cbor_map! { "id" => cbor_bytes!(vec![0x01]), "name" => "user" },
+            0x04 => cbor_array![cbor_map! { "alg" => -7, "type" => "public-key" }],
+            0x06 => cbor_map! { "pinComplexityPolicy" => true },
+        };
+        let mut cmd_bytes = vec![0x01];
+        super::cbor_write(make_cred_auth, &mut cmd_bytes).unwrap();
+        let mc_auth_resp = state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL);
+        assert_eq!(mc_auth_resp[0], 0x00);
+        let auth_data_bytes = cbor::reader::read(&mc_auth_resp[1..])
+            .unwrap()
+            .extract_map()
+            .unwrap()
+            .into_iter()
+            .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+            .unwrap()
+            .extract_byte_string()
+            .unwrap();
+        assert_ne!(auth_data_bytes[32] & ED_FLAG, 0);
+        assert!(
+            auth_data_bytes
+                .windows(b"pinComplexityPolicy".len() + 1)
+                .any(
+                    |w| &w[..b"pinComplexityPolicy".len()] == b"pinComplexityPolicy"
+                        && w[b"pinComplexityPolicy".len()] == 0xF5
+                )
+        );
+
+        // Reset restores pinComplexityPolicy back to its default (false).
+        let mut reset_state = CtapState::new(&mut env);
+        assert_eq!(
+            reset_state.process_command(&mut env, &[0x07], DUMMY_CHANNEL)[0],
+            0x00
+        );
+        let info_after_reset = read_info_map(&mut env, &mut reset_state);
+        let policy_after_reset = info_after_reset
+            .iter()
+            .find_map(|(k, v)| (k.clone().extract_unsigned() == Some(0x1B)).then_some(v.clone()))
+            .unwrap()
+            .extract_bool()
+            .unwrap();
+        assert!(!policy_after_reset);
+    }
+
+    #[test]
+    fn test_get_assertion_hmac_secret_with_and_without_uv() {
+        let mut env = TestEnv::default();
+        let mut state = CtapState::new(&mut env);
+        let pin = b"1234";
+        let protocol = PinUvAuthProtocol::V2;
+        ctap_set_pin(&mut env, &mut state, protocol, pin);
+
+        let token = retrieve_pin_token(&mut env, &mut state, protocol, pin);
+        let mc_auth = authenticate_signature(&token, &[0xAA; 32], protocol);
+        let mc_resp = run_make_credential_options_hmac(
+            &mut env,
+            &mut state,
+            true,
+            None,
+            Some(mc_auth),
+            Some(protocol),
+            false,
+            false,
+        )
+        .unwrap();
+        let mc_auth_data = cbor::reader::read(&mc_resp)
+            .unwrap()
+            .extract_map()
+            .unwrap()
+            .into_iter()
+            .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+            .unwrap()
+            .extract_byte_string()
+            .unwrap();
+        let credential_id = extract_credential_id(&mc_auth_data);
+
+        let eval_hmac_secret = |env: &mut TestEnv,
+                                state: &mut CtapState<TestEnv>,
+                                cred_id: &[u8],
+                                with_uv: bool|
+         -> Vec<u8> {
+            let ga_token_opt = with_uv.then(|| retrieve_pin_token(env, state, protocol, pin));
+            let cose_key = hmac_get_key_agreement(env, state, protocol);
+            let authenticator_public = cose_key.try_into_ecdh_public_key::<TestEnv>().unwrap();
+            let platform_private = EcdhSk::<TestEnv>::random(env.rng());
+            let platform_cose_key =
+                CoseKey::from_ecdh_public_key::<TestEnv>(platform_private.public_key());
+            let handshake = get_shared_secret(&platform_private, &authenticator_public);
+
+            let salt = [0x42u8; 32];
+            let salt_enc = encrypt_salt(protocol, &handshake, &salt, env.rng());
+            let verification_key = get_verification_key(&handshake, protocol);
+            let salt_auth = authenticate_signature(&verification_key, &salt_enc, protocol);
+            let hmac_input = cbor_map! {
+                1 => platform_cose_key,
+                2 => cbor_bytes!(salt_enc),
+                3 => cbor_bytes!(salt_auth),
+                4 => protocol as u64,
+            };
+
+            let client_data_hash = [0xBBu8; 32];
+            let pin_uv_auth_param =
+                ga_token_opt.map(|t| authenticate_signature(&t, &client_data_hash, protocol));
+            let resp_bytes = run_get_assertion_hmac(
+                env,
+                state,
+                "rp.com".to_string(),
+                cred_id.to_vec(),
+                Some(hmac_input),
+                pin_uv_auth_param,
+                with_uv.then_some(protocol),
+            )
+            .unwrap();
+
+            let auth_data = cbor::reader::read(&resp_bytes)
+                .unwrap()
+                .extract_map()
+                .unwrap()
+                .into_iter()
+                .find_map(|(k, v)| (k.extract_unsigned() == Some(0x02)).then_some(v))
+                .unwrap()
+                .extract_byte_string()
+                .unwrap();
+            let ext_map = cbor::reader::read(&auth_data[37..])
+                .unwrap()
+                .extract_map()
+                .unwrap();
+            let output_enc = ext_map
+                .into_iter()
+                .find_map(|(k, v)| {
+                    (k.extract_text_string().as_deref() == Some("hmac-secret")).then_some(v)
+                })
+                .unwrap()
+                .extract_byte_string()
+                .unwrap();
+
+            let mut aes_key_bytes = [0u8; 32];
+            SoftwareHkdf256::hkdf_empty_salt_256(&handshake, b"CTAP2 AES key", &mut aes_key_bytes);
+            super::crypto_wrapper::aes256_cbc_decrypt::<TestEnv>(
+                &SoftwareAes256::new(&aes_key_bytes),
+                &output_enc,
+                true,
+            )
+            .unwrap()
+            .to_vec()
+        };
+
+        let out_no_uv_1 = eval_hmac_secret(&mut env, &mut state, &credential_id, false);
+        let out_no_uv_2 = eval_hmac_secret(&mut env, &mut state, &credential_id, false);
+        assert_eq!(out_no_uv_1.len(), 32);
+        assert_eq!(out_no_uv_1, out_no_uv_2);
+
+        let out_with_uv_1 = eval_hmac_secret(&mut env, &mut state, &credential_id, true);
+        let out_with_uv_2 = eval_hmac_secret(&mut env, &mut state, &credential_id, true);
+        assert_eq!(out_with_uv_1.len(), 32);
+        assert_eq!(out_with_uv_1, out_with_uv_2);
+
+        // CredRandomWithoutUV and CredRandomWithUV produce distinct outputs!
+        assert_ne!(out_no_uv_1, out_with_uv_1);
+    }
+
+    #[test]
+    #[cfg(feature = "fingerprint")]
+    fn test_get_info_uv_count_since_last_pin_entry_end_to_end() {
+        let mut env = TestEnv::default();
+        env.create_fingerprint().unwrap();
+        let mut state = CtapState::new(&mut env);
+        let pin = b"1234";
+        ctap_set_pin(&mut env, &mut state, PinUvAuthProtocol::V2, pin);
+
+        let get_uv_count = |env: &mut TestEnv, state: &mut CtapState<TestEnv>| -> u64 {
+            let resp = state.process_command(env, &[0x04], DUMMY_CHANNEL);
+            assert_eq!(resp[0], 0x00);
+            cbor::reader::read(&resp[1..])
+                .unwrap()
+                .extract_map()
+                .unwrap()
+                .into_iter()
+                .find_map(|(k, v)| (k.extract_unsigned() == Some(0x17)).then_some(v))
+                .unwrap()
+                .extract_unsigned()
+                .unwrap()
+        };
+
+        assert_eq!(get_uv_count(&mut env, &mut state), 0);
+
+        // Built-in UV during MakeCredential increments 0x17 to 1.
+        let make_cred = cbor_map! {
+            0x01 => cbor_bytes!(vec![0xAA; 32]),
+            0x02 => cbor_map! { "id" => "rp.com" },
+            0x03 => cbor_map! { "id" => cbor_bytes!(vec![0x01]), "name" => "user" },
+            0x04 => cbor_array![cbor_map! { "alg" => -7, "type" => "public-key" }],
+            0x07 => cbor_map! { "rk" => true, "uv" => true },
+        };
+        let mut cmd_bytes = vec![0x01];
+        super::cbor_write(make_cred, &mut cmd_bytes).unwrap();
+        assert_eq!(
+            state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL)[0],
+            0x00
+        );
+        assert_eq!(get_uv_count(&mut env, &mut state), 1);
+
+        // Built-in UV during GetAssertion increments 0x17 to 2.
+        let get_assert = cbor_map! {
+            0x01 => "rp.com",
+            0x02 => cbor_bytes!(vec![0xBB; 32]),
+            0x05 => cbor_map! { "uv" => true },
+        };
+        let mut cmd_bytes = vec![0x02];
+        super::cbor_write(get_assert, &mut cmd_bytes).unwrap();
+        assert_eq!(
+            state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL)[0],
+            0x00
+        );
+        assert_eq!(get_uv_count(&mut env, &mut state), 2);
+
+        // Wrong PIN entry does NOT reset uvCountSinceLastPinEntry.
+        let cose_key = hmac_get_key_agreement(&mut env, &mut state, PinUvAuthProtocol::V2);
+        let authenticator_public = cose_key.try_into_ecdh_public_key::<TestEnv>().unwrap();
+        let platform_private = EcdhSk::<TestEnv>::random(env.rng());
+        let platform_cose_key =
+            CoseKey::from_ecdh_public_key::<TestEnv>(platform_private.public_key());
+        let handshake = get_shared_secret(&platform_private, &authenticator_public);
+        let bad_hash = SoftwareSha256::digest(b"9999");
+        let bad_hash_enc =
+            encrypt_pin_hash(PinUvAuthProtocol::V2, &handshake, &bad_hash, env.rng());
+        let bad_pin_cmd = cbor_map! {
+            0x01 => PinUvAuthProtocol::V2 as u64,
+            0x02 => ClientPinSubCommand::GetPinUvAuthTokenUsingPinWithPermissions as u64,
+            0x03 => platform_cose_key,
+            0x06 => cbor_bytes!(bad_hash_enc),
+            0x09 => 0x01u64,
+            0x0A => "rp.com",
+        };
+        let mut cmd_bytes = vec![0x06];
+        super::cbor_write(bad_pin_cmd, &mut cmd_bytes).unwrap();
+        assert_eq!(
+            state.process_command(&mut env, &cmd_bytes, DUMMY_CHANNEL)[0],
+            Ctap2StatusCode::CTAP2_ERR_PIN_INVALID as u8
+        );
+        assert_eq!(get_uv_count(&mut env, &mut state), 2);
+
+        // Valid PIN entry resets uvCountSinceLastPinEntry to 0.
+        let _ = retrieve_pin_token(&mut env, &mut state, PinUvAuthProtocol::V2, pin);
+        assert_eq!(get_uv_count(&mut env, &mut state), 0);
     }
 }

@@ -189,7 +189,9 @@ pub trait Persist {
         pin_properties[0] = pin_code_point_length;
         pin_properties[1..].clone_from_slice(pin_hash);
         self.insert(keys::PIN_PROPERTIES, &pin_properties[..])?;
-        // If power fails between these 2 transactions, PIN has to be set again.
+        #[cfg(feature = "fingerprint")]
+        self.reset_uv_count_since_last_pin_entry()?;
+        // If power fails between these transactions, PIN has to be set again.
         self.remove(keys::FORCE_PIN_CHANGE)
     }
 
@@ -236,6 +238,49 @@ pub trait Persist {
     #[cfg(feature = "fingerprint")]
     fn reset_uv_retries(&mut self) -> CtapResult<()> {
         self.remove(keys::UV_RETRIES)
+    }
+
+    /// Returns the number of internal UV operations since the last PIN entry.
+    #[cfg(feature = "fingerprint")]
+    fn uv_count_since_last_pin_entry(&self) -> CtapResult<u32> {
+        match self.find(keys::UV_COUNT_SINCE_LAST_PIN_ENTRY)? {
+            None => Ok(0),
+            Some(value) if value.len() == 4 => Ok(u32::from_be_bytes(*array_ref![value, 0, 4])),
+            _ => Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR),
+        }
+    }
+
+    /// Increments the number of internal UV operations since the last PIN entry.
+    #[cfg(feature = "fingerprint")]
+    fn incr_uv_count_since_last_pin_entry(&mut self) -> CtapResult<()> {
+        let old_value = self.uv_count_since_last_pin_entry()?;
+        let new_value = old_value.saturating_add(1);
+        self.insert(
+            keys::UV_COUNT_SINCE_LAST_PIN_ENTRY,
+            &new_value.to_be_bytes(),
+        )
+    }
+
+    /// Resets the number of internal UV operations since the last PIN entry.
+    #[cfg(feature = "fingerprint")]
+    fn reset_uv_count_since_last_pin_entry(&mut self) -> CtapResult<()> {
+        self.remove(keys::UV_COUNT_SINCE_LAST_PIN_ENTRY)
+    }
+
+    /// Returns whether the PIN complexity policy was enabled via AuthenticatorConfig.
+    #[cfg(feature = "config_command")]
+    fn has_pin_complexity_policy(&self) -> CtapResult<bool> {
+        match self.find(keys::PIN_COMPLEXITY_POLICY)? {
+            None => Ok(false),
+            Some(value) if value.is_empty() => Ok(true),
+            _ => Err(Ctap2StatusCode::CTAP2_ERR_VENDOR_INTERNAL_ERROR),
+        }
+    }
+
+    /// Marks the PIN complexity policy as enabled.
+    #[cfg(feature = "config_command")]
+    fn enable_pin_complexity_policy(&mut self) -> CtapResult<()> {
+        self.insert(keys::PIN_COMPLEXITY_POLICY, &[])
     }
 
     /// Returns the minimum PIN length, if stored.

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use super::data_formats::{
-    AuthenticatorTransport, CoseKey, CredentialProtectionPolicy, PackedAttestationStatement,
-    PublicKeyCredentialDescriptor, PublicKeyCredentialParameter, PublicKeyCredentialRpEntity,
-    PublicKeyCredentialUserEntity,
+    AuthenticatorTransport, ConfigSubCommand, CoseKey, CredentialProtectionPolicy,
+    PackedAttestationStatement, PublicKeyCredentialDescriptor, PublicKeyCredentialParameter,
+    PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity,
 };
 #[cfg(feature = "fingerprint")]
 use super::fingerprint::TemplateInfo;
@@ -70,7 +70,7 @@ impl From<ResponseData> for Option<cbor::Value> {
 pub struct AuthenticatorMakeCredentialResponse {
     pub fmt: String,
     pub auth_data: Vec<u8>,
-    pub att_stmt: PackedAttestationStatement,
+    pub att_stmt: Option<PackedAttestationStatement>,
     pub ep_att: Option<bool>,
     pub large_blob_key: Option<Vec<u8>>,
 }
@@ -151,6 +151,16 @@ pub struct AuthenticatorGetInfoResponse {
     pub certifications: Option<Vec<(String, i64)>>,
     pub remaining_discoverable_credentials: Option<u64>,
     // - 0x15: vendorPrototypeConfigCommands missing as we don't support it.
+    pub attestation_formats: Option<Vec<String>>,
+    pub uv_count_since_last_pin_entry: Option<u64>,
+    // - 0x18: longTouchForReset missing as we don't support it.
+    // - 0x19: encIdentifier missing (not yet implemented).
+    pub transports_for_reset: Option<Vec<AuthenticatorTransport>>,
+    pub pin_complexity_policy: Option<bool>,
+    pub pin_complexity_policy_url: Option<Vec<u8>>,
+    pub max_pin_length: Option<u8>,
+    // - 0x1E: encCredStoreState missing (not yet implemented).
+    pub authenticator_config_commands: Option<Vec<ConfigSubCommand>>,
 }
 
 impl From<AuthenticatorGetInfoResponse> for cbor::Value {
@@ -176,6 +186,13 @@ impl From<AuthenticatorGetInfoResponse> for cbor::Value {
             uv_modality,
             certifications,
             remaining_discoverable_credentials,
+            attestation_formats,
+            uv_count_since_last_pin_entry,
+            transports_for_reset,
+            pin_complexity_policy,
+            pin_complexity_policy_url,
+            max_pin_length,
+            authenticator_config_commands,
         } = get_info_response;
 
         let options_cbor: Option<cbor::Value> = options.map(|options| {
@@ -215,6 +232,13 @@ impl From<AuthenticatorGetInfoResponse> for cbor::Value {
             0x12 => uv_modality,
             0x13 => certifications_cbor,
             0x14 => remaining_discoverable_credentials,
+            0x16 => attestation_formats.map(|vec| cbor_array_vec!(vec)),
+            0x17 => uv_count_since_last_pin_entry,
+            0x1A => transports_for_reset.map(|vec| cbor_array_vec!(vec)),
+            0x1B => pin_complexity_policy,
+            0x1C => pin_complexity_policy_url,
+            0x1D => max_pin_length.map(|u| u as u64),
+            0x1F => authenticator_config_commands.map(|vec| cbor_array_vec!(vec)),
         }
     }
 }
@@ -378,7 +402,7 @@ mod test {
         let make_credential_response = AuthenticatorMakeCredentialResponse {
             fmt: "packed".to_string(),
             auth_data: vec![0xAD],
-            att_stmt,
+            att_stmt: Some(att_stmt),
             ep_att: Some(true),
             large_blob_key: Some(vec![0x1B]),
         };
@@ -389,6 +413,25 @@ mod test {
             0x02 => vec![0xAD],
             0x03 => cbor_packed_attestation_statement,
             0x04 => true,
+            0x05 => vec![0x1B],
+        };
+        assert_eq!(response_cbor, Some(expected_cbor));
+    }
+
+    #[test]
+    fn test_make_credential_none_into_cbor() {
+        let make_credential_response = AuthenticatorMakeCredentialResponse {
+            fmt: "none".to_string(),
+            auth_data: vec![0xAD],
+            att_stmt: None,
+            ep_att: None,
+            large_blob_key: Some(vec![0x1B]),
+        };
+        let response_cbor: Option<cbor::Value> =
+            ResponseData::AuthenticatorMakeCredential(make_credential_response).into();
+        let expected_cbor = cbor_map_options! {
+            0x01 => "none",
+            0x02 => vec![0xAD],
             0x05 => vec![0x1B],
         };
         assert_eq!(response_cbor, Some(expected_cbor));
@@ -461,6 +504,13 @@ mod test {
             uv_modality: None,
             certifications: None,
             remaining_discoverable_credentials: None,
+            attestation_formats: None,
+            uv_count_since_last_pin_entry: None,
+            transports_for_reset: None,
+            pin_complexity_policy: None,
+            pin_complexity_policy_url: None,
+            max_pin_length: None,
+            authenticator_config_commands: None,
         };
         let response_cbor: Option<cbor::Value> =
             ResponseData::AuthenticatorGetInfo(get_info_response).into();
@@ -495,6 +545,16 @@ mod test {
             uv_modality: Some(1),
             certifications: Some(vec![(String::from("example-cert"), 1)]),
             remaining_discoverable_credentials: Some(150),
+            attestation_formats: Some(vec!["packed".to_string()]),
+            uv_count_since_last_pin_entry: Some(3),
+            transports_for_reset: Some(vec![AuthenticatorTransport::Usb]),
+            pin_complexity_policy: Some(true),
+            pin_complexity_policy_url: Some(b"https://example.com/policy".to_vec()),
+            max_pin_length: Some(63),
+            authenticator_config_commands: Some(vec![
+                ConfigSubCommand::ToggleAlwaysUv,
+                ConfigSubCommand::SetMinPinLength,
+            ]),
         };
         let response_cbor: Option<cbor::Value> =
             ResponseData::AuthenticatorGetInfo(get_info_response).into();
@@ -519,6 +579,13 @@ mod test {
             0x12 => 1,
             0x13 => cbor_map! {"example-cert" => 1},
             0x14 => 150,
+            0x16 => cbor_array!["packed"],
+            0x17 => 3,
+            0x1A => cbor_array!["usb"],
+            0x1B => true,
+            0x1C => b"https://example.com/policy".to_vec(),
+            0x1D => 63,
+            0x1F => cbor_array![2, 3],
         };
         assert_eq!(response_cbor, Some(expected_cbor));
     }

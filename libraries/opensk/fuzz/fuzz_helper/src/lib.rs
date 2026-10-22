@@ -162,6 +162,7 @@ fn setup_customization(
         // matter), and use the rp ids in commands.
         None,
     );
+    customization.setup_pin_complexity_policy(Option::<bool>::arbitrary(unstructured)?, None);
     if !is_valid(customization) {
         return Err(FuzzError::InvalidCustomization);
     }

@@ -76,6 +76,35 @@ pub trait Customization {
     /// the minimum PIN length with the minPinLength extension.
     fn default_min_pin_length_rp_ids(&self) -> Vec<String>;
 
+    /// Sets the initial PIN complexity policy state.
+    ///
+    /// - `None`: PIN complexity policy is not supported.
+    /// - `Some(false)`: Supported, disabled by default after reset, and can be enabled via
+    ///   `setMinPINLength`.
+    /// - `Some(true)`: Supported and enabled by default.
+    fn default_pin_complexity_policy(&self) -> Option<bool>;
+
+    /// Optional URL (encoded as UTF-8 bytes) providing information about the PIN complexity policy.
+    ///
+    /// # Invariant
+    ///
+    /// - Must be `None` if `default_pin_complexity_policy()` is `None`.
+    /// - If `Some`, must not be empty.
+    fn pin_complexity_policy_url(&self) -> Option<&[u8]>;
+
+    /// Checks whether a candidate PIN satisfies the additional PIN complexity policy.
+    ///
+    /// Evaluated during `SetPin` and `ChangePin` when `pinComplexityPolicy` is enabled.
+    fn check_pin_complexity(&self, pin: &str) -> bool;
+
+    /// Sets the maximum PIN length in Unicode code points.
+    ///
+    /// # Invariant
+    ///
+    /// - Must be in the range [8, 63].
+    /// - Must be at least `default_min_pin_length()`.
+    fn max_pin_length(&self) -> u8;
+
     /// Enforces the alwaysUv option.
     ///
     /// When setting to true, commands require a PIN.
@@ -291,12 +320,25 @@ pub trait Customization {
     fn max_template_friendly_name(&self) -> usize;
 }
 
+/// Default PIN complexity check: rejects PINs composed of a single repeated character.
+pub fn default_pin_complexity_check(pin: &str) -> bool {
+    let mut chars = pin.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    chars.any(|c| c != first)
+}
+
 #[derive(Clone)]
 pub struct CustomizationImpl {
     pub allows_pin_protocol_v1: bool,
     pub default_cred_protect: Option<CredentialProtectionPolicy>,
     pub default_min_pin_length: u8,
     pub default_min_pin_length_rp_ids: &'static [&'static str],
+    pub default_pin_complexity_policy: Option<bool>,
+    pub pin_complexity_policy_url: Option<&'static [u8]>,
+    pub pin_complexity_check: fn(&str) -> bool,
+    pub max_pin_length: u8,
     pub enforce_always_uv: bool,
     pub enterprise_attestation_mode: Option<EnterpriseAttestationMode>,
     pub enterprise_rp_id_list: &'static [&'static str],
@@ -324,6 +366,10 @@ pub const DEFAULT_CUSTOMIZATION: CustomizationImpl = CustomizationImpl {
     default_cred_protect: None,
     default_min_pin_length: 4,
     default_min_pin_length_rp_ids: &[],
+    default_pin_complexity_policy: None,
+    pin_complexity_policy_url: None,
+    pin_complexity_check: default_pin_complexity_check,
+    max_pin_length: 63,
     enforce_always_uv: false,
     enterprise_attestation_mode: None,
     enterprise_rp_id_list: &[],
@@ -364,6 +410,22 @@ impl Customization for CustomizationImpl {
             .iter()
             .map(|s| String::from(*s))
             .collect()
+    }
+
+    fn default_pin_complexity_policy(&self) -> Option<bool> {
+        self.default_pin_complexity_policy
+    }
+
+    fn pin_complexity_policy_url(&self) -> Option<&[u8]> {
+        self.pin_complexity_policy_url
+    }
+
+    fn check_pin_complexity(&self, pin: &str) -> bool {
+        (self.pin_complexity_check)(pin)
+    }
+
+    fn max_pin_length(&self) -> u8 {
+        self.max_pin_length
     }
 
     fn enforce_always_uv(&self) -> bool {
@@ -456,6 +518,21 @@ pub fn is_valid(customization: &impl Customization) -> bool {
 
     // Default min pin length must be between 4 and 63.
     if customization.default_min_pin_length() < 4 || customization.default_min_pin_length() > 63 {
+        return false;
+    }
+
+    // Max PIN length must be in [8, 63] and at least default_min_pin_length.
+    if customization.max_pin_length() < 8
+        || customization.max_pin_length() > 63
+        || customization.default_min_pin_length() > customization.max_pin_length()
+    {
+        return false;
+    }
+
+    // PIN complexity policy URL requires PIN complexity policy support and must be non-empty.
+    if let Some(url) = customization.pin_complexity_policy_url()
+        && (customization.default_pin_complexity_policy().is_none() || url.is_empty())
+    {
         return false;
     }
 
@@ -558,6 +635,10 @@ mod test {
             default_cred_protect: None,
             default_min_pin_length: 4,
             default_min_pin_length_rp_ids: &["example.com"],
+            default_pin_complexity_policy: Some(false),
+            pin_complexity_policy_url: Some(b"https://example.com/pin"),
+            pin_complexity_check: default_pin_complexity_check,
+            max_pin_length: 32,
             enforce_always_uv: false,
             enterprise_attestation_mode: None,
             enterprise_rp_id_list: &[],
@@ -586,6 +667,14 @@ mod test {
             customization.default_min_pin_length_rp_ids(),
             vec![String::from("example.com")]
         );
+        assert_eq!(customization.default_pin_complexity_policy(), Some(false));
+        assert_eq!(
+            customization.pin_complexity_policy_url(),
+            Some(&b"https://example.com/pin"[..])
+        );
+        assert!(customization.check_pin_complexity("1234"));
+        assert!(!customization.check_pin_complexity("1111"));
+        assert_eq!(customization.max_pin_length(), 32);
         assert!(!customization.enforce_always_uv());
         assert!(customization.enterprise_attestation_mode().is_none());
         assert!(customization.enterprise_rp_id_list().is_empty());

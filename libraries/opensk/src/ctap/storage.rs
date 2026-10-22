@@ -30,9 +30,7 @@ use sk_cbor::cbor_array_vec;
 pub fn init(env: &mut impl Env) -> CtapResult<()> {
     env.persist().init()?;
     env.key_store().init()?;
-    if env.persist().pin_hash()?.is_some()
-        && env.persist().persistent_pin_uv_auth_token()?.is_none()
-    {
+    if env.persist().persistent_pin_uv_auth_token()?.is_none() {
         crate::ctap::client_pin::reset_persistent_pin_uv_auth_token(env)?;
     }
     Ok(())
@@ -228,6 +226,46 @@ pub fn decr_uv_retries(env: &mut impl Env) -> CtapResult<()> {
 #[cfg(feature = "fingerprint")]
 pub fn reset_uv_retries(env: &mut impl Env) -> CtapResult<()> {
     env.persist().reset_uv_retries()
+}
+
+/// Returns the number of internal UV operations since the last PIN entry.
+#[cfg(feature = "fingerprint")]
+pub fn uv_count_since_last_pin_entry(env: &mut impl Env) -> CtapResult<u32> {
+    env.persist().uv_count_since_last_pin_entry()
+}
+
+/// Increments the number of internal UV operations since the last PIN entry.
+#[cfg(feature = "fingerprint")]
+pub fn incr_uv_count_since_last_pin_entry(env: &mut impl Env) -> CtapResult<()> {
+    env.persist().incr_uv_count_since_last_pin_entry()
+}
+
+/// Resets the number of internal UV operations since the last PIN entry.
+#[cfg(feature = "fingerprint")]
+pub fn reset_uv_count_since_last_pin_entry(env: &mut impl Env) -> CtapResult<()> {
+    env.persist().reset_uv_count_since_last_pin_entry()
+}
+
+/// Returns the current PIN complexity policy status, if supported.
+#[cfg(not(feature = "config_command"))]
+pub fn pin_complexity_policy(env: &mut impl Env) -> CtapResult<Option<bool>> {
+    Ok(env.customization().default_pin_complexity_policy())
+}
+
+/// Returns the current PIN complexity policy status, if supported.
+#[cfg(feature = "config_command")]
+pub fn pin_complexity_policy(env: &mut impl Env) -> CtapResult<Option<bool>> {
+    Ok(match env.customization().default_pin_complexity_policy() {
+        None => None,
+        Some(true) => Some(true),
+        Some(false) => Some(env.persist().has_pin_complexity_policy()?),
+    })
+}
+
+/// Enables the PIN complexity policy.
+#[cfg(feature = "config_command")]
+pub fn enable_pin_complexity_policy(env: &mut impl Env) -> CtapResult<()> {
+    env.persist().enable_pin_complexity_policy()
 }
 
 /// Returns the minimum PIN length.

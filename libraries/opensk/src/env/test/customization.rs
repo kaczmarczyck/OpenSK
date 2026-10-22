@@ -22,6 +22,10 @@ pub struct TestCustomization {
     default_cred_protect: Option<CredentialProtectionPolicy>,
     default_min_pin_length: u8,
     default_min_pin_length_rp_ids: Vec<String>,
+    default_pin_complexity_policy: Option<bool>,
+    pin_complexity_policy_url: Option<Vec<u8>>,
+    pin_complexity_check: fn(&str) -> bool,
+    max_pin_length: u8,
     enforce_always_uv: bool,
     enterprise_attestation_mode: Option<EnterpriseAttestationMode>,
     enterprise_rp_id_list: Vec<String>,
@@ -47,6 +51,23 @@ pub struct TestCustomization {
 impl TestCustomization {
     pub fn set_allows_pin_protocol_v1(&mut self, is_allowed: bool) {
         self.allows_pin_protocol_v1 = is_allowed;
+    }
+
+    pub fn set_max_pin_length(&mut self, max_pin_length: u8) {
+        self.max_pin_length = max_pin_length;
+    }
+
+    pub fn set_default_min_pin_length_rp_ids(&mut self, rp_ids: Vec<String>) {
+        self.default_min_pin_length_rp_ids = rp_ids;
+    }
+
+    pub fn setup_pin_complexity_policy(&mut self, policy: Option<bool>, url: Option<Vec<u8>>) {
+        self.default_pin_complexity_policy = policy;
+        self.pin_complexity_policy_url = url;
+    }
+
+    pub fn set_pin_complexity_check(&mut self, check: fn(&str) -> bool) {
+        self.pin_complexity_check = check;
     }
 
     pub fn setup_enterprise_attestation(
@@ -76,6 +97,22 @@ impl Customization for TestCustomization {
 
     fn default_min_pin_length_rp_ids(&self) -> Vec<String> {
         self.default_min_pin_length_rp_ids.clone()
+    }
+
+    fn default_pin_complexity_policy(&self) -> Option<bool> {
+        self.default_pin_complexity_policy
+    }
+
+    fn pin_complexity_policy_url(&self) -> Option<&[u8]> {
+        self.pin_complexity_policy_url.as_deref()
+    }
+
+    fn check_pin_complexity(&self, pin: &str) -> bool {
+        (self.pin_complexity_check)(pin)
+    }
+
+    fn max_pin_length(&self) -> u8 {
+        self.max_pin_length
     }
 
     fn enforce_always_uv(&self) -> bool {
@@ -158,6 +195,10 @@ impl From<CustomizationImpl> for TestCustomization {
             default_cred_protect,
             default_min_pin_length,
             default_min_pin_length_rp_ids,
+            default_pin_complexity_policy,
+            pin_complexity_policy_url,
+            pin_complexity_check,
+            max_pin_length,
             enforce_always_uv,
             enterprise_attestation_mode,
             enterprise_rp_id_list,
@@ -190,11 +231,17 @@ impl From<CustomizationImpl> for TestCustomization {
             .map(|s| String::from(*s))
             .collect::<Vec<_>>();
 
+        let pin_complexity_policy_url = pin_complexity_policy_url.map(|u| u.to_vec());
+
         Self {
             allows_pin_protocol_v1,
             default_cred_protect,
             default_min_pin_length,
             default_min_pin_length_rp_ids,
+            default_pin_complexity_policy,
+            pin_complexity_policy_url,
+            pin_complexity_check,
+            max_pin_length,
             enforce_always_uv,
             enterprise_attestation_mode,
             enterprise_rp_id_list,

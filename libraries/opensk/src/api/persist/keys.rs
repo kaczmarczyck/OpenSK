@@ -106,6 +106,16 @@ make_partition! {
     /// The stored large blob can be too big for one key, so it has to be sharded.
     LARGE_BLOB_SHARDS = 2000..2004;
 
+    /// Number of internal UV operations since the last PIN entry.
+    ///
+    /// If the entry is absent, the count is 0.
+    #[cfg(feature = "fingerprint")]
+    UV_COUNT_SINCE_LAST_PIN_ENTRY = 2029;
+
+    /// If this entry exists and is empty, PIN complexity policy was enabled via setMinPINLength.
+    #[cfg(feature = "config_command")]
+    PIN_COMPLEXITY_POLICY = 2030;
+
     /// Stored friendly names for enrolled fingerprints.
     #[cfg(feature = "fingerprint")]
     FRIENDLY_NAMES = 2031..2037;

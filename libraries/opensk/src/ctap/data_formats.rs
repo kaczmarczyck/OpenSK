@@ -307,6 +307,7 @@ pub struct MakeCredentialExtensions {
     pub hmac_secret_mc: Option<GetAssertionHmacSecretInput>,
     pub cred_protect: Option<CredentialProtectionPolicy>,
     pub min_pin_length: bool,
+    pub pin_complexity_policy: bool,
     pub cred_blob: Option<Vec<u8>>,
     pub large_blob_key: Option<bool>,
     pub third_party_payment: bool,
@@ -325,6 +326,7 @@ impl TryFrom<cbor::Value> for MakeCredentialExtensions {
                 "minPinLength" => min_pin_length,
                 "hmac-secret-mc" => hmac_secret_mc,
                 "thirdPartyPayment" => third_party_payment,
+                "pinComplexityPolicy" => pin_complexity_policy,
             } = extract_map(cbor_value)?;
         }
 
@@ -336,6 +338,7 @@ impl TryFrom<cbor::Value> for MakeCredentialExtensions {
             .map(CredentialProtectionPolicy::try_from)
             .transpose()?;
         let min_pin_length = min_pin_length.map_or(Ok(false), extract_bool)?;
+        let pin_complexity_policy = pin_complexity_policy.map_or(Ok(false), extract_bool)?;
         let cred_blob = cred_blob.map(extract_byte_string).transpose()?;
         let large_blob_key = large_blob_key.map(extract_bool).transpose()?;
         if let Some(large_blob_key) = large_blob_key
@@ -349,6 +352,7 @@ impl TryFrom<cbor::Value> for MakeCredentialExtensions {
             hmac_secret_mc,
             cred_protect,
             min_pin_length,
+            pin_complexity_policy,
             cred_blob,
             large_blob_key,
             third_party_payment,
@@ -404,7 +408,7 @@ pub struct GetAssertionHmacSecretInput {
     pub key_agreement: CoseKey,
     pub salt_enc: Vec<u8>,
     pub salt_auth: Vec<u8>,
-    pub pin_uv_auth_protocol: PinUvAuthProtocol,
+    pub pin_uv_auth_protocol: Option<PinUvAuthProtocol>,
 }
 
 impl TryFrom<cbor::Value> for GetAssertionHmacSecretInput {
@@ -423,8 +427,9 @@ impl TryFrom<cbor::Value> for GetAssertionHmacSecretInput {
         let key_agreement = CoseKey::try_from(ok_or_missing(key_agreement)?)?;
         let salt_enc = extract_byte_string(ok_or_missing(salt_enc)?)?;
         let salt_auth = extract_byte_string(ok_or_missing(salt_auth)?)?;
-        let pin_uv_auth_protocol =
-            pin_uv_auth_protocol.map_or(Ok(PinUvAuthProtocol::V1), PinUvAuthProtocol::try_from)?;
+        let pin_uv_auth_protocol = pin_uv_auth_protocol
+            .map(PinUvAuthProtocol::try_from)
+            .transpose()?;
         Ok(Self {
             key_agreement,
             salt_enc,
@@ -1058,6 +1063,7 @@ pub struct SetMinPinLengthParams {
     pub new_min_pin_length: Option<u8>,
     pub min_pin_length_rp_ids: Option<Vec<String>>,
     pub force_change_pin: Option<bool>,
+    pub pin_complexity_policy: Option<bool>,
 }
 
 impl TryFrom<cbor::Value> for SetMinPinLengthParams {
@@ -1069,6 +1075,7 @@ impl TryFrom<cbor::Value> for SetMinPinLengthParams {
                 0x01 => new_min_pin_length,
                 0x02 => min_pin_length_rp_ids,
                 0x03 => force_change_pin,
+                0x04 => pin_complexity_policy,
             } = extract_map(cbor_value)?;
         }
 
@@ -1098,11 +1105,13 @@ impl TryFrom<cbor::Value> for SetMinPinLengthParams {
             None => None,
         };
         let force_change_pin = force_change_pin.map(extract_bool).transpose()?;
+        let pin_complexity_policy = pin_complexity_policy.map(extract_bool).transpose()?;
 
         Ok(Self {
             new_min_pin_length,
             min_pin_length_rp_ids,
             force_change_pin,
+            pin_complexity_policy,
         })
     }
 }
@@ -1113,6 +1122,7 @@ impl From<SetMinPinLengthParams> for cbor::Value {
             0x01 => params.new_min_pin_length.map(|u| u as u64),
             0x02 => params.min_pin_length_rp_ids.map(|vec| cbor_array_vec!(vec)),
             0x03 => params.force_change_pin,
+            0x04 => params.pin_complexity_policy,
         }
     }
 }
@@ -1802,6 +1812,7 @@ mod test {
             "hmac-secret" => true,
             "largeBlobKey" => true,
             "minPinLength" => true,
+            "pinComplexityPolicy" => true,
             "thirdPartyPayment" => true,
         };
         let extensions = MakeCredentialExtensions::try_from(cbor_extensions);
@@ -1810,6 +1821,7 @@ mod test {
             hmac_secret_mc: None,
             cred_protect: Some(CredentialProtectionPolicy::UserVerificationRequired),
             min_pin_length: true,
+            pin_complexity_policy: true,
             cred_blob: Some(vec![0xCB]),
             large_blob_key: Some(true),
             third_party_payment: true,
@@ -1835,7 +1847,7 @@ mod test {
             key_agreement: cose_key,
             salt_enc: vec![0x02; 32],
             salt_auth: vec![0x03; 16],
-            pin_uv_auth_protocol: PinUvAuthProtocol::V1,
+            pin_uv_auth_protocol: None,
         };
         let expected_extensions = GetAssertionExtensions {
             hmac_secret: Some(expected_input),
@@ -1865,7 +1877,7 @@ mod test {
             key_agreement: cose_key,
             salt_enc: vec![0x02; 32],
             salt_auth: vec![0x03; 16],
-            pin_uv_auth_protocol: PinUvAuthProtocol::V2,
+            pin_uv_auth_protocol: Some(PinUvAuthProtocol::V2),
         };
         let expected_extensions = GetAssertionExtensions {
             hmac_secret: Some(expected_input),
@@ -2191,11 +2203,13 @@ mod test {
             new_min_pin_length: Some(6),
             min_pin_length_rp_ids: Some(vec!["example.com".to_string()]),
             force_change_pin: Some(true),
+            pin_complexity_policy: Some(true),
         };
         let cbor_params = cbor_map! {
             0x01 => 6,
             0x02 => cbor_array!("example.com".to_string()),
             0x03 => true,
+            0x04 => true,
         };
         assert_eq!(cbor::Value::from(params.clone()), cbor_params);
         let reconstructed_params = SetMinPinLengthParams::try_from(cbor_params);
@@ -2234,6 +2248,7 @@ mod test {
             new_min_pin_length: Some(6),
             min_pin_length_rp_ids: Some(vec!["r".repeat(MAX_RP_ID_LENGTH)]),
             force_change_pin: None,
+            pin_complexity_policy: None,
         };
         let cbor_params = cbor_map! {
             0x01 => 6,
@@ -2248,6 +2263,7 @@ mod test {
             new_min_pin_length: Some(6),
             min_pin_length_rp_ids: Some(vec!["example.com".to_string()]),
             force_change_pin: Some(true),
+            pin_complexity_policy: Some(true),
         };
         let config_sub_command_params =
             ConfigSubCommandParams::SetMinPinLength(set_min_pin_length_params);
@@ -2255,6 +2271,7 @@ mod test {
             0x01 => 6,
             0x02 => cbor_array!("example.com".to_string()),
             0x03 => true,
+            0x04 => true,
         };
         assert_eq!(cbor::Value::from(config_sub_command_params), cbor_params);
     }
